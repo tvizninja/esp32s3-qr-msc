@@ -1,0 +1,4 @@
+dependencies:
+  espressif/esp_tinyusb: ^1.7.6
+  espressif/led_strip: ^3.0.3
+  espressif/quirc: ^1.2.0
