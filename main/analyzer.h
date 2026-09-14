@@ -54,6 +54,7 @@ void analyzer_diag_mark(
 );
 
 void analyzer_diag_print_last(void);
+size_t analyzer_diag_format_last(char *buffer, size_t buffer_size);
 
 #ifdef __cplusplus
 }

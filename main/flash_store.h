@@ -82,13 +82,14 @@ esp_err_t flash_store_read_range(
 /*
  * Analyzer RAW diagnostic storage.
  *
- * The qrstore partition reserves its final 40 physical 8 KiB slots
- * (320 KiB) for one 640x480 GRAY8 frame. The visible 500-record policy is
- * unchanged; history still has 720 physical ring slots.
+ * The qrstore partition reserves its final 44 physical 8 KiB slots
+ * for one 640x480 GRAY8 frame plus one packed 1bpp frame. The visible
+ * 500-record policy is unchanged; history still has more than 500 ring slots.
  */
 #define FLASH_STORE_RAW_WIDTH   640u
 #define FLASH_STORE_RAW_HEIGHT  480u
 #define FLASH_STORE_RAW_BYTES   (FLASH_STORE_RAW_WIDTH * FLASH_STORE_RAW_HEIGHT)
+#define FLASH_STORE_BINARY_BYTES ((FLASH_STORE_RAW_WIDTH * FLASH_STORE_RAW_HEIGHT) / 8u)
 
 esp_err_t flash_store_raw_begin(void);
 
@@ -103,6 +104,23 @@ esp_err_t flash_store_raw_commit(void);
 bool flash_store_raw_available(void);
 
 esp_err_t flash_store_raw_read(
+    size_t offset,
+    uint8_t *buffer,
+    size_t length
+);
+
+/* Analyzer packed 1bpp diagnostic storage. */
+esp_err_t flash_store_binary_write(
+    size_t offset,
+    const uint8_t *data,
+    size_t length
+);
+
+esp_err_t flash_store_binary_commit(void);
+
+bool flash_store_binary_available(void);
+
+esp_err_t flash_store_binary_read(
     size_t offset,
     uint8_t *buffer,
     size_t length

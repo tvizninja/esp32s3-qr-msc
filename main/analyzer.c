@@ -56,6 +56,12 @@ enum
     AD_DECODE_TASK_CREATED = 170,
     AD_DECODE_DONE = 180,
     AD_QUIRC_DESTROYED = 190,
+    AD_BINARY_START = 191,
+    AD_BINARY_HEAP_SNAPSHOT_OK = 192,
+    AD_BINARY_MALLOC_OK = 193,
+    AD_BINARY_POSTALLOC_HEAP_OK = 194,
+    AD_BINARY_HIST_DONE = 195,
+    AD_BINARY_PACK_DONE = 196,
     AD_JSON_BUILT = 200,
     AD_FAT_REBUILD_START = 210,
     AD_FAT_REBUILD_DONE = 220,
@@ -73,11 +79,15 @@ enum
 #define ANALYZER_SOURCE_BYTES   \
     (ANALYZER_SOURCE_WIDTH * ANALYZER_SOURCE_HEIGHT)
 
-#define ANALYZER_QUIRC_WIDTH    600
-#define ANALYZER_QUIRC_HEIGHT   480
-#define ANALYZER_CROP_X          20
-#define ANALYZER_QUIRC_BYTES    \
-    (ANALYZER_QUIRC_WIDTH * ANALYZER_QUIRC_HEIGHT)
+#define ANALYZER_BINARY_ROW_BYTES \
+    ((ANALYZER_SOURCE_WIDTH + 7) / 8)
+#define ANALYZER_BINARY_BYTES \
+    (ANALYZER_BINARY_ROW_BYTES * ANALYZER_SOURCE_HEIGHT)
+
+#define ANALYZER_PASS1_WIDTH   320
+#define ANALYZER_PASS1_HEIGHT  240
+#define ANALYZER_PASS2_WIDTH   480
+#define ANALYZER_PASS2_HEIGHT  360
 
 #define ANALYZER_BAUD_NORMAL 115200
 #define ANALYZER_BAUD_IMAGE  115200
@@ -94,14 +104,6 @@ enum
 static bool s_mode_enabled = false;
 static char *s_json = NULL;
 static size_t s_json_len = 0;
-
-static const uint8_t CMD_BAUD_READ[] = {
-    0x23, 0x41, 0x41
-};
-
-static const uint8_t CMD_BAUD_115200[] = {
-    0x21, 0x41, 0x41, 0x0B
-};
 
 static const uint8_t CMD_IMAGE_RAW_640X480[] = {
     0x60, 0x02, 0x80, 0x01, 0xE0, 0x00, 0x00
@@ -151,6 +153,19 @@ typedef struct
     size_t heap_before_decode;
     size_t largest_before_decode;
 
+    bool binary_probe_attempted;
+    bool binary_probe_ready;
+    uint8_t binary_otsu_threshold;
+    size_t binary_bytes;
+    int64_t binary_histogram_ms;
+    int64_t binary_pack_ms;
+    size_t heap_before_binary;
+    size_t largest_before_binary;
+    size_t heap_with_binary;
+    size_t largest_with_binary;
+    uint32_t binary_black_pixels;
+    uint32_t binary_checksum;
+
     char status[64];
     char detail[192];
 } image_analysis_t;
@@ -172,6 +187,15 @@ typedef struct
 
 static void decode_task(
     void *arg
+);
+
+static esp_err_t analyzer_capture_raw_only(
+    uart_port_t uart_num,
+    image_analysis_t *result
+);
+
+static esp_err_t analyzer_binary_probe(
+    image_analysis_t *result
 );
 
 static int uart_read_exact(
@@ -303,6 +327,18 @@ static const char *diag_stage_name(
             return "DECODE_DONE";
         case AD_QUIRC_DESTROYED:
             return "QUIRC_DESTROYED";
+        case AD_BINARY_START:
+            return "BINARY_START";
+        case AD_BINARY_HEAP_SNAPSHOT_OK:
+            return "BINARY_HEAP_SNAPSHOT_OK";
+        case AD_BINARY_MALLOC_OK:
+            return "BINARY_MALLOC_OK";
+        case AD_BINARY_POSTALLOC_HEAP_OK:
+            return "BINARY_POSTALLOC_HEAP_OK";
+        case AD_BINARY_HIST_DONE:
+            return "BINARY_HIST_DONE";
+        case AD_BINARY_PACK_DONE:
+            return "BINARY_PACK_DONE";
         case AD_JSON_BUILT:
             return "JSON_BUILT";
         case AD_FAT_REBUILD_START:
@@ -399,6 +435,105 @@ void analyzer_diag_mark(
     );
 }
 
+size_t analyzer_diag_format_last(
+    char *buffer,
+    size_t buffer_size)
+{
+    if (buffer == NULL || buffer_size == 0)
+    {
+        return 0;
+    }
+
+    buffer[0] = '\0';
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(
+        ANALYZER_NVS_NAMESPACE,
+        NVS_READONLY,
+        &handle
+    );
+
+    if (err != ESP_OK)
+    {
+        int written = snprintf(
+            buffer,
+            buffer_size,
+            "last_analyzer_diag=NONE\r\n"
+            "nvs_open=%s\r\n",
+            esp_err_to_name(err)
+        );
+        return written > 0 ? (size_t)written : 0;
+    }
+
+    uint16_t stage = 0;
+    int32_t error_code = 0;
+    uint32_t free_8bit = 0;
+    uint32_t largest_8bit = 0;
+
+    esp_err_t stage_err = nvs_get_u16(
+        handle,
+        ANALYZER_DIAG_STAGE_KEY,
+        &stage
+    );
+    (void)nvs_get_i32(
+        handle,
+        ANALYZER_DIAG_ERROR_KEY,
+        &error_code
+    );
+    (void)nvs_get_u32(
+        handle,
+        ANALYZER_DIAG_FREE_KEY,
+        &free_8bit
+    );
+    (void)nvs_get_u32(
+        handle,
+        ANALYZER_DIAG_LARGEST_KEY,
+        &largest_8bit
+    );
+    nvs_close(handle);
+
+    if (stage_err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        int written = snprintf(
+            buffer,
+            buffer_size,
+            "last_analyzer_diag=NONE\r\n"
+        );
+        return written > 0 ? (size_t)written : 0;
+    }
+
+    int written = snprintf(
+        buffer,
+        buffer_size,
+        "last_analyzer_diag=PRESENT\r\n"
+        "stage=%u\r\n"
+        "stage_name=%s\r\n"
+        "failed=%s\r\n"
+        "error_code=%ld\r\n"
+        "free_8bit=%lu\r\n"
+        "largest_8bit=%lu\r\n",
+        (unsigned)stage,
+        diag_stage_name(stage),
+        stage >= AD_FAIL_BASE ? "true" : "false",
+        (long)error_code,
+        (unsigned long)free_8bit,
+        (unsigned long)largest_8bit
+    );
+
+    if (written < 0)
+    {
+        buffer[0] = '\0';
+        return 0;
+    }
+
+    if ((size_t)written >= buffer_size)
+    {
+        return buffer_size - 1;
+    }
+
+    return (size_t)written;
+}
+
 void analyzer_diag_print_last(void)
 {
     nvs_handle_t handle;
@@ -477,18 +612,6 @@ void analyzer_diag_print_last(void)
         (unsigned long)free_8bit,
         (unsigned long)largest_8bit
     );
-}
-
-static esp_err_t diag_fail(
-    uint16_t base_stage,
-    esp_err_t error_code)
-{
-    analyzer_diag_mark(
-        (uint16_t)(AD_FAIL_BASE + base_stage),
-        (int32_t)error_code
-    );
-
-    return error_code;
 }
 
 typedef struct
@@ -967,313 +1090,6 @@ static esp_err_t analyzer_uart_install(
     }
 
     return ESP_OK;
-}
-
-
-static bool scanner_baud_read(
-    uart_port_t uart_num,
-    uint8_t *value)
-{
-    uint8_t reply[4] = {0};
-
-    uart_flush_input(
-        uart_num
-    );
-
-    uart_send(
-        uart_num,
-        CMD_BAUD_READ,
-        sizeof(CMD_BAUD_READ)
-    );
-
-    if (
-        uart_read_exact(
-            uart_num,
-            reply,
-            sizeof(reply),
-            600) !=
-        (int)sizeof(reply))
-    {
-        return false;
-    }
-
-    if (
-        reply[0] != 0x24 ||
-        reply[1] != 0x41 ||
-        reply[2] != 0x41)
-    {
-        return false;
-    }
-
-    *value = reply[3];
-
-    return true;
-}
-
-static bool scanner_set_baud(
-    uart_port_t uart_num,
-    const uint8_t *command,
-    size_t command_length,
-    int new_baud,
-    uint8_t expected_parameter)
-{
-    uint8_t reply[5] = {0};
-
-    uart_flush_input(
-        uart_num
-    );
-
-    uart_send(
-        uart_num,
-        command,
-        command_length
-    );
-
-    int got =
-        uart_read_exact(
-            uart_num,
-            reply,
-            sizeof(reply),
-            700
-        );
-
-    if (
-        got == (int)sizeof(reply))
-    {
-        ESP_LOGI(
-            TAG,
-            "baud write reply: %02X %02X %02X %02X %02X",
-            reply[0],
-            reply[1],
-            reply[2],
-            reply[3],
-            reply[4]
-        );
-
-        if (
-            reply[0] != 0x22 ||
-            reply[1] != 0x41 ||
-            reply[2] != 0x41 ||
-            reply[3] != expected_parameter ||
-            reply[4] != 0x00)
-        {
-            return false;
-        }
-    }
-    else
-    {
-        ESP_LOGW(
-            TAG,
-            "baud ACK incomplete at old rate; verifying at new rate"
-        );
-    }
-
-    if (
-        uart_set_baudrate(
-            uart_num,
-            new_baud) != ESP_OK)
-    {
-        return false;
-    }
-
-    vTaskDelay(
-        pdMS_TO_TICKS(100)
-    );
-
-    uint8_t value = 0;
-
-    if (
-        !scanner_baud_read(
-            uart_num,
-            &value))
-    {
-        return false;
-    }
-
-    if (
-        value !=
-        expected_parameter)
-    {
-        ESP_LOGE(
-            TAG,
-            "baud readback mismatch: got=0x%02X expected=0x%02X",
-            value,
-            expected_parameter
-        );
-
-        return false;
-    }
-
-    ESP_LOGI(
-        TAG,
-        "scanner baud verified: %d bps parameter=0x%02X",
-        new_baud,
-        value
-    );
-
-    return true;
-}
-
-static bool scanner_restore_115200(
-    uart_port_t uart_num)
-{
-    uint8_t value = 0;
-
-    if (
-        uart_set_baudrate(
-            uart_num,
-            ANALYZER_BAUD_IMAGE) == ESP_OK)
-    {
-        vTaskDelay(
-            pdMS_TO_TICKS(30)
-        );
-
-        if (
-            scanner_baud_read(
-                uart_num,
-                &value) &&
-            value == 0x0C)
-        {
-            return scanner_set_baud(
-                uart_num,
-                CMD_BAUD_115200,
-                sizeof(CMD_BAUD_115200),
-                ANALYZER_BAUD_NORMAL,
-                0x0B
-            );
-        }
-    }
-
-    if (
-        uart_set_baudrate(
-            uart_num,
-            ANALYZER_BAUD_NORMAL) == ESP_OK)
-    {
-        vTaskDelay(
-            pdMS_TO_TICKS(30)
-        );
-
-        if (
-            scanner_baud_read(
-                uart_num,
-                &value) &&
-            value == 0x0B)
-        {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static bool receive_image_downsampled(
-    uart_port_t uart_num,
-    uint8_t *analysis_image,
-    size_t analysis_image_length)
-{
-    if (
-        analysis_image_length !=
-        ANALYZER_QUIRC_BYTES)
-    {
-        return false;
-    }
-
-    /*
-     * Native-pitch center crop:
-     *
-     * Scanner source: 640x480 GRAY8
-     * quirc image:    600x480 GRAY8
-     *
-     * Discard only 20 source pixels on the left and right of every row.
-     * There is NO resampling and therefore no QR module-resolution loss.
-     *
-     * 600*480 = 288000 bytes, safely below the measured post-quirc_new
-     * contiguous block (~294912 bytes) on the integrated AtomS3 Lite.
-     */
-    uint8_t *row =
-        heap_caps_malloc(
-            ANALYZER_SOURCE_WIDTH,
-            MALLOC_CAP_8BIT
-        );
-
-    if (row == NULL)
-    {
-        return false;
-    }
-
-    size_t source_received = 0;
-    int64_t next_progress_us =
-        esp_timer_get_time() + 1000000;
-    bool ok = true;
-
-    for (
-        int y = 0;
-        y < ANALYZER_SOURCE_HEIGHT;
-        ++y)
-    {
-        int got =
-            uart_read_exact(
-                uart_num,
-                row,
-                ANALYZER_SOURCE_WIDTH,
-                IMAGE_BODY_GAP_MS
-            );
-
-        if (
-            got !=
-            ANALYZER_SOURCE_WIDTH)
-        {
-            ok = false;
-            break;
-        }
-
-        if (
-            flash_store_raw_write(
-                (size_t)y *
-                    ANALYZER_SOURCE_WIDTH,
-                row,
-                ANALYZER_SOURCE_WIDTH
-            ) != ESP_OK)
-        {
-            ESP_LOGE(
-                TAG,
-                "RAW diagnostic Flash write failed at row %d",
-                y
-            );
-            ok = false;
-            break;
-        }
-
-        source_received +=
-            ANALYZER_SOURCE_WIDTH;
-
-        memcpy(
-            analysis_image +
-                (size_t)y *
-                ANALYZER_QUIRC_WIDTH,
-            row + ANALYZER_CROP_X,
-            ANALYZER_QUIRC_WIDTH
-        );
-
-        int64_t now_us =
-            esp_timer_get_time();
-
-        if (now_us >= next_progress_us)
-        {
-            analyzer_progress_hook();
-            next_progress_us =
-                now_us + 1000000;
-        }
-    }
-
-    heap_caps_free(
-        row
-    );
-
-    return
-        ok &&
-        source_received ==
-            ANALYZER_SOURCE_BYTES;
 }
 
 
@@ -1969,844 +1785,566 @@ static void decode_task(
     );
 }
 
+
+/*
+ * Analyzer-only binary diagnostic.
+ *
+ * The scanner RAW frame is already committed to Flash. Read it twice in
+ * 640-byte rows: first to build a 256-bin histogram and derive an Otsu
+ * threshold, then to pack the full 640x480 image into 1 bit/pixel. The
+ * packed image remains a diagnostic artifact only; QR detection and decode
+ * are performed by stock quirc on downscaled grayscale images.
+ */
+static uint8_t analyzer_otsu_threshold(
+    const uint32_t histogram[256],
+    uint32_t total_pixels)
+{
+    uint64_t sum_all = 0;
+    for (int i = 0; i < 256; ++i)
+    {
+        sum_all += (uint64_t)i * histogram[i];
+    }
+
+    uint64_t sum_background = 0;
+    uint32_t weight_background = 0;
+    double best_variance = -1.0;
+    uint8_t best_threshold = 0;
+
+    for (int t = 0; t < 256; ++t)
+    {
+        weight_background += histogram[t];
+        if (weight_background == 0)
+        {
+            continue;
+        }
+
+        uint32_t weight_foreground =
+            total_pixels - weight_background;
+        if (weight_foreground == 0)
+        {
+            break;
+        }
+
+        sum_background +=
+            (uint64_t)t * histogram[t];
+
+        double mean_background =
+            (double)sum_background /
+            (double)weight_background;
+        double mean_foreground =
+            (double)(sum_all - sum_background) /
+            (double)weight_foreground;
+        double delta =
+            mean_background - mean_foreground;
+        double variance =
+            (double)weight_background *
+            (double)weight_foreground *
+            delta * delta;
+
+        if (variance > best_variance)
+        {
+            best_variance = variance;
+            best_threshold = (uint8_t)t;
+        }
+    }
+
+    return best_threshold;
+}
+
+static esp_err_t analyzer_capture_raw_only(
+    uart_port_t uart_num,
+    image_analysis_t *result)
+{
+    esp_err_t err = flash_store_raw_begin();
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    uart_flush_input(uart_num);
+    uart_send(uart_num, CMD_IMAGE_RAW_640X480, sizeof(CMD_IMAGE_RAW_640X480));
+    analyzer_diag_mark(AD_IMAGE_REQUEST_SENT, 0);
+
+    uint8_t command = 0;
+    if (uart_read_exact(uart_num, &command, 1, IMAGE_HEADER_TIMEOUT_MS) != 1 || command != 0x61)
+    {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    uint8_t first = 0;
+    if (uart_read_exact(uart_num, &first, 1, IMAGE_HEADER_TIMEOUT_MS) != 1)
+    {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (first == 0x00)
+    {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    uint8_t header[10] = {0};
+    header[0] = first;
+    if (uart_read_exact(uart_num, &header[1], 9, IMAGE_HEADER_TIMEOUT_MS) != 9)
+    {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    result->image_width = ((uint16_t)header[0] << 8) | header[1];
+    result->image_height = ((uint16_t)header[2] << 8) | header[3];
+    result->image_type = header[4];
+    result->image_bytes = ((uint32_t)header[6] << 24) |
+                          ((uint32_t)header[7] << 16) |
+                          ((uint32_t)header[8] << 8) |
+                          header[9];
+
+    if (result->image_width != ANALYZER_SOURCE_WIDTH ||
+        result->image_height != ANALYZER_SOURCE_HEIGHT ||
+        (result->image_type & 0x0F) != 0 ||
+        result->image_bytes != ANALYZER_SOURCE_BYTES)
+    {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    result->image_supported = true;
+    analyzer_diag_mark(AD_IMAGE_HEADER_OK, (int32_t)result->image_bytes);
+
+    uint8_t *row = heap_caps_malloc(ANALYZER_SOURCE_WIDTH, MALLOC_CAP_8BIT);
+    if (row == NULL)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
+    int64_t start_us = esp_timer_get_time();
+    analyzer_diag_mark(AD_IMAGE_RX_START, 0);
+    for (int y = 0; y < ANALYZER_SOURCE_HEIGHT; ++y)
+    {
+        if (uart_read_exact(uart_num, row, ANALYZER_SOURCE_WIDTH, IMAGE_BODY_GAP_MS) != ANALYZER_SOURCE_WIDTH)
+        {
+            heap_caps_free(row);
+            return ESP_ERR_TIMEOUT;
+        }
+        err = flash_store_raw_write((size_t)y * ANALYZER_SOURCE_WIDTH, row, ANALYZER_SOURCE_WIDTH);
+        if (err != ESP_OK)
+        {
+            heap_caps_free(row);
+            return err;
+        }
+        if ((y & 15) == 15)
+        {
+            taskYIELD();
+        }
+    }
+    heap_caps_free(row);
+    result->transfer_ms = (esp_timer_get_time() - start_us) / 1000;
+
+    err = flash_store_raw_commit();
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+    analyzer_diag_mark(AD_IMAGE_RX_DONE, (int32_t)result->transfer_ms);
+    return ESP_OK;
+}
+
+static esp_err_t analyzer_binary_probe(
+    image_analysis_t *result)
+{
+    if (result == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    result->binary_probe_attempted = true;
+    result->binary_bytes = ANALYZER_BINARY_BYTES;
+
+    analyzer_diag_mark(AD_BINARY_START, 0);
+
+    static uint32_t histogram[256];
+    static uint8_t row[ANALYZER_SOURCE_WIDTH];
+    static uint8_t packed_row[ANALYZER_BINARY_ROW_BYTES];
+
+    memset(histogram, 0, sizeof(histogram));
+
+    int64_t histogram_start = esp_timer_get_time();
+
+    for (size_t y = 0; y < ANALYZER_SOURCE_HEIGHT; ++y)
+    {
+        esp_err_t err = flash_store_raw_read(
+            y * ANALYZER_SOURCE_WIDTH, row, sizeof(row));
+        if (err != ESP_OK) return err;
+
+        for (size_t x = 0; x < ANALYZER_SOURCE_WIDTH; ++x)
+        {
+            ++histogram[row[x]];
+        }
+
+        if ((y & 0x0Fu) == 0x0Fu)
+        {
+            analyzer_progress_hook();
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+    }
+
+    result->binary_histogram_ms =
+        (esp_timer_get_time() - histogram_start) / 1000;
+    result->binary_otsu_threshold =
+        analyzer_otsu_threshold(histogram, ANALYZER_SOURCE_BYTES);
+
+    analyzer_diag_mark(AD_BINARY_HIST_DONE, 0);
+
+    int64_t pack_start = esp_timer_get_time();
+    uint32_t black_pixels = 0;
+    uint32_t checksum = 2166136261u;
+
+    for (size_t y = 0; y < ANALYZER_SOURCE_HEIGHT; ++y)
+    {
+        esp_err_t err = flash_store_raw_read(
+            y * ANALYZER_SOURCE_WIDTH, row, sizeof(row));
+        if (err != ESP_OK) return err;
+
+        memset(packed_row, 0, sizeof(packed_row));
+
+        for (size_t x = 0; x < ANALYZER_SOURCE_WIDTH; ++x)
+        {
+            if (row[x] <= result->binary_otsu_threshold)
+            {
+                packed_row[x >> 3] |= (uint8_t)(0x80u >> (x & 7));
+                ++black_pixels;
+            }
+        }
+
+        for (size_t i = 0; i < ANALYZER_BINARY_ROW_BYTES; ++i)
+        {
+            checksum ^= packed_row[i];
+            checksum *= 16777619u;
+        }
+
+        err = flash_store_binary_write(
+            y * ANALYZER_BINARY_ROW_BYTES, packed_row, sizeof(packed_row));
+        if (err != ESP_OK) return err;
+
+        if ((y & 0x0Fu) == 0x0Fu)
+        {
+            analyzer_progress_hook();
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+    }
+
+    esp_err_t commit_err = flash_store_binary_commit();
+    if (commit_err != ESP_OK) return commit_err;
+
+    result->binary_pack_ms =
+        (esp_timer_get_time() - pack_start) / 1000;
+    result->binary_black_pixels = black_pixels;
+    result->binary_checksum = checksum;
+    result->binary_probe_ready = true;
+
+    result->heap_before_binary = 0;
+    result->largest_before_binary = 0;
+    result->heap_with_binary = 0;
+    result->largest_with_binary = 0;
+
+    analyzer_diag_mark(AD_BINARY_PACK_DONE, 0);
+
+    ESP_LOGI(
+        TAG,
+        "Flash-backed compact 1bpp ready: threshold=%u bytes=%u black=%u hist=%lldms pack=%lldms checksum=%08lX",
+        (unsigned)result->binary_otsu_threshold,
+        (unsigned)result->binary_bytes,
+        (unsigned)result->binary_black_pixels,
+        (long long)result->binary_histogram_ms,
+        (long long)result->binary_pack_ms,
+        (unsigned long)result->binary_checksum
+    );
+
+    return ESP_OK;
+}
+
+
+static esp_err_t fill_quirc_image_from_raw_flash(
+    uint8_t *dst,
+    int dst_width,
+    int dst_height)
+{
+    if (dst == NULL || dst_width <= 0 || dst_height <= 0)
+        return ESP_ERR_INVALID_ARG;
+
+    uint8_t *row = heap_caps_malloc(ANALYZER_SOURCE_WIDTH, MALLOC_CAP_8BIT);
+    if (row == NULL)
+        return ESP_ERR_NO_MEM;
+
+    int cached_sy = -1;
+    for (int y = 0; y < dst_height; ++y)
+    {
+        int sy = (y * ANALYZER_SOURCE_HEIGHT) / dst_height;
+        if (sy >= ANALYZER_SOURCE_HEIGHT)
+            sy = ANALYZER_SOURCE_HEIGHT - 1;
+
+        if (sy != cached_sy)
+        {
+            esp_err_t err = flash_store_raw_read(
+                (size_t)sy * ANALYZER_SOURCE_WIDTH,
+                row,
+                ANALYZER_SOURCE_WIDTH);
+            if (err != ESP_OK)
+            {
+                heap_caps_free(row);
+                return err;
+            }
+            cached_sy = sy;
+        }
+
+        uint8_t *out = dst + (size_t)y * dst_width;
+        for (int x = 0; x < dst_width; ++x)
+        {
+            int sx = (x * ANALYZER_SOURCE_WIDTH) / dst_width;
+            if (sx >= ANALYZER_SOURCE_WIDTH)
+                sx = ANALYZER_SOURCE_WIDTH - 1;
+            out[x] = row[sx];
+        }
+
+        if ((y & 31) == 31)
+        {
+            analyzer_progress_hook();
+            taskYIELD();
+        }
+    }
+
+    heap_caps_free(row);
+    return ESP_OK;
+}
+
+static esp_err_t run_quirc_flash_pass(
+    int width,
+    int height,
+    int scale_num,
+    int scale_den,
+    const uint8_t *payload,
+    size_t payload_len,
+    image_analysis_t *result)
+{
+    struct quirc *q = quirc_new();
+    if (q == NULL)
+        return ESP_ERR_NO_MEM;
+
+    if (quirc_resize(q, width, height) < 0)
+    {
+        quirc_destroy(q);
+        return ESP_ERR_NO_MEM;
+    }
+
+    int image_w = 0;
+    int image_h = 0;
+    uint8_t *image = quirc_begin(q, &image_w, &image_h);
+    if (image == NULL || image_w != width || image_h != height)
+    {
+        quirc_destroy(q);
+        return ESP_FAIL;
+    }
+
+    esp_err_t fill_err = fill_quirc_image_from_raw_flash(image, width, height);
+    if (fill_err != ESP_OK)
+    {
+        quirc_destroy(q);
+        return fill_err;
+    }
+
+    quirc_end(q);
+
+    result->analysis_width = (uint16_t)width;
+    result->analysis_height = (uint16_t)height;
+    result->detected_symbols = quirc_count(q);
+    result->quirc_detected = result->detected_symbols > 0;
+
+    if (result->detected_symbols <= 0)
+    {
+        quirc_destroy(q);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    log_heap(
+        "before quirc ladder decode task",
+        &result->heap_before_decode,
+        &result->largest_before_decode);
+
+    decode_task_ctx_t context = {
+        .q = q,
+        .symbol_count = result->detected_symbols,
+        .scanner_payload = payload,
+        .scanner_payload_len = payload_len,
+        .result = result,
+        .notify_task = xTaskGetCurrentTaskHandle(),
+        .source_offset_x = 0,
+        .source_offset_y = 0,
+        .scale_num = scale_num,
+        .scale_den = scale_den
+    };
+
+    BaseType_t created = xTaskCreate(
+        decode_task,
+        "qrt_ladder_decode",
+        DECODE_TASK_STACK_BYTES,
+        &context,
+        5,
+        NULL);
+
+    if (created != pdPASS)
+    {
+        quirc_destroy(q);
+        return ESP_ERR_NO_MEM;
+    }
+
+    uint32_t notified = ulTaskNotifyTake(
+        pdTRUE,
+        pdMS_TO_TICKS(DECODE_TASK_TIMEOUT_MS));
+
+    if (notified == 0)
+    {
+        /* Do not destroy q if the decode task might still be using it. */
+        return ESP_ERR_TIMEOUT;
+    }
+
+    quirc_destroy(q);
+    return result->quirc_decoded ? ESP_OK : ESP_FAIL;
+}
+
 static esp_err_t analyze_image(
     uart_port_t uart_num,
     const uint8_t *payload,
     size_t payload_len,
     image_analysis_t *result)
 {
-    memset(
-        result,
-        0,
-        sizeof(*result)
-    );
+    memset(result, 0, sizeof(*result));
+    result->attempted = true;
+    result->version = -1;
+    result->ecc_level = -1;
+    result->mask = -1;
+    result->data_type = -1;
+    snprintf(result->status, sizeof(result->status), "STARTING");
 
-    result->attempted =
-        true;
-
-    analyzer_diag_mark(
-        AD_BEFORE_QUIRC,
-        0
-    );
-
-    result->version =
-        -1;
-
-    result->ecc_level =
-        -1;
-
-    result->mask =
-        -1;
-
-    result->data_type =
-        -1;
-
-    snprintf(
-        result->status,
-        sizeof(result->status),
-        "STARTING"
-    );
+    analyzer_diag_mark(AD_BEFORE_QUIRC, 0);
 
     /*
-     * Match the successful dedicated probe's allocation order:
-     * native quirc image first, UART RX ring second.
+     * Capture the scanner-native image first and commit it to Flash.  QR
+     * decoding then works from Flash so the UART RX ring and a large quirc
+     * image never have to coexist during the 27 s transfer.
      */
-    esp_err_t uart_delete_err =
-        uart_driver_delete(
-            uart_num
-        );
+    esp_err_t capture_err = analyzer_capture_raw_only(uart_num, result);
+    if (capture_err != ESP_OK)
+    {
+        snprintf(result->status, sizeof(result->status), "RAW_CAPTURE_FAILED");
+        snprintf(result->detail, sizeof(result->detail),
+                 "Unable to capture native 640x480 GRAY8 image: %s",
+                 esp_err_to_name(capture_err));
+        return capture_err;
+    }
+    result->image_received = true;
 
+    /* Keep the 1bpp diagnostic path, but do not use it for QR logic. */
+    esp_err_t binary_err = analyzer_binary_probe(result);
+    if (binary_err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "1bpp diagnostic generation failed: %s",
+                 esp_err_to_name(binary_err));
+    }
+
+    /* Release the UART ring before allocating quirc's analysis image. */
+    esp_err_t uart_delete_err = uart_driver_delete(uart_num);
     if (uart_delete_err != ESP_OK)
     {
-        snprintf(
-            result->status,
-            sizeof(result->status),
-            "UART_RELEASE_FAILED"
-        );
-
-        snprintf(
-            result->detail,
-            sizeof(result->detail),
-            "Unable to release UART driver before native quirc allocation"
-        );
-
+        snprintf(result->status, sizeof(result->status), "UART_RELEASE_FAILED");
         return uart_delete_err;
     }
 
-    log_heap(
-        "before quirc after UART release",
-        &result->heap_before_quirc,
-        &result->largest_before_quirc
-    );
+    log_heap("before quirc resolution ladder",
+             &result->heap_before_quirc,
+             &result->largest_before_quirc);
 
-    struct quirc *q =
-        quirc_new();
+    esp_err_t pass1 = run_quirc_flash_pass(
+        ANALYZER_PASS1_WIDTH,
+        ANALYZER_PASS1_HEIGHT,
+        2,
+        1,
+        payload,
+        payload_len,
+        result);
 
-    if (q != NULL)
+    if (pass1 == ESP_OK && result->quirc_decoded)
     {
-        analyzer_diag_mark(
-            AD_QUIRC_NEW_OK,
-            0
-        );
+        snprintf(result->status, sizeof(result->status), "QUIRC_OK");
+        snprintf(result->detail, sizeof(result->detail),
+                 "Flash RAW decoded by stock quirc at 320x240");
+        log_heap("after quirc pass1", &result->heap_after_quirc,
+                 &result->largest_after_quirc);
+        (void)analyzer_uart_install(uart_num);
+        return ESP_OK;
     }
 
-    if (q == NULL)
+    /* Reset pass-local decode flags before the higher-resolution retry. */
+    result->quirc_decoded = false;
+    result->payload_match = false;
+    result->decoded_payload_len = 0;
+    result->detected_symbols = 0;
+    result->quirc_detected = false;
+
+    esp_err_t pass2 = run_quirc_flash_pass(
+        ANALYZER_PASS2_WIDTH,
+        ANALYZER_PASS2_HEIGHT,
+        4,
+        3,
+        payload,
+        payload_len,
+        result);
+
+    log_heap("after quirc pass2", &result->heap_after_quirc,
+             &result->largest_after_quirc);
+
+    esp_err_t reinstall_err = analyzer_uart_install(uart_num);
+    if (reinstall_err != ESP_OK)
     {
-        snprintf(
-            result->status,
-            sizeof(result->status),
-            "QUIRC_NEW_OOM"
-        );
-
-        snprintf(
-            result->detail,
-            sizeof(result->detail),
-            "quirc_new failed"
-        );
-
-        analyzer_uart_install(
-            uart_num
-        );
-
-        return diag_fail(
-            AD_QUIRC_NEW_OK,
-            ESP_ERR_NO_MEM
-        );
+        snprintf(result->status, sizeof(result->status), "UART_REINSTALL_FAILED");
+        return reinstall_err;
     }
 
-    if (
-        quirc_resize(
-            q,
-            ANALYZER_QUIRC_WIDTH,
-            ANALYZER_QUIRC_HEIGHT) < 0)
+    if (pass2 == ESP_OK && result->quirc_decoded)
     {
-        snprintf(
-            result->status,
-            sizeof(result->status),
-            "QUIRC_IMAGE_OOM"
-        );
+        snprintf(result->status, sizeof(result->status), "QUIRC_OK");
+        snprintf(result->detail, sizeof(result->detail),
+                 "Flash RAW decoded by stock quirc at 480x360 after 320x240 retry");
+        return ESP_OK;
+    }
 
-        snprintf(
-            result->detail,
-            sizeof(result->detail),
-            "Need contiguous 288000-byte native-pitch 600x480 center-crop buffer"
-        );
+    /*
+     * quirc found geometry but could not decode at 480x360: let the same
+     * mature library retry only the QR neighborhood at scanner-native
+     * resolution.  No custom Finder/alignment/perspective code is used.
+     */
+    if (result->quirc_detected)
+    {
+        esp_err_t crop_err = run_native_crop_decode(
+            uart_num, payload, payload_len, result);
+        if (crop_err == ESP_OK && result->quirc_decoded)
+        {
+            snprintf(result->detail, sizeof(result->detail),
+                     "Stock quirc detected at 480x360 and decoded a native-resolution crop");
+            return ESP_OK;
+        }
+    }
 
-        log_heap(
-            "quirc resize failed",
-            &result->heap_after_quirc,
-            &result->largest_after_quirc
-        );
-
-        quirc_destroy(
-            q
-        );
-
-        analyzer_uart_install(
-            uart_num
-        );
-
+    if (pass2 == ESP_ERR_NO_MEM)
+    {
+        snprintf(result->status, sizeof(result->status), "QUIRC_480_OOM");
+        snprintf(result->detail, sizeof(result->detail),
+                 "320x240 did not decode and stock quirc could not allocate 480x360");
         return ESP_ERR_NO_MEM;
     }
 
-    analyzer_diag_mark(
-        AD_QUIRC_RESIZE_OK,
-        0
-    );
-
-    log_heap(
-        "after quirc image allocation",
-        &result->heap_after_quirc,
-        &result->largest_after_quirc
-    );
-
-    int image_w = 0;
-    int image_h = 0;
-
-    uint8_t *image =
-        quirc_begin(
-            q,
-            &image_w,
-            &image_h
-        );
-
-    if (
-        image == NULL ||
-        image_w !=
-            ANALYZER_QUIRC_WIDTH ||
-        image_h !=
-            ANALYZER_QUIRC_HEIGHT)
-    {
-        snprintf(
-            result->status,
-            sizeof(result->status),
-            "QUIRC_BEGIN_FAILED"
-        );
-
-        quirc_destroy(
-            q
-        );
-
-        analyzer_uart_install(
-            uart_num
-        );
-
-        return ESP_FAIL;
-    }
-
-    analyzer_diag_mark(
-        AD_QUIRC_BEGIN_OK,
-        0
-    );
-
-    result->analysis_width =
-        ANALYZER_QUIRC_WIDTH;
-
-    result->analysis_height =
-        ANALYZER_QUIRC_HEIGHT;
-
-    esp_err_t uart_install_err =
-        analyzer_uart_install(
-            uart_num
-        );
-
-    if (uart_install_err != ESP_OK)
-    {
-        snprintf(
-            result->status,
-            sizeof(result->status),
-            "UART_REINSTALL_FAILED"
-        );
-
-        snprintf(
-            result->detail,
-            sizeof(result->detail),
-            "Native quirc image allocated but UART driver could not be restored"
-        );
-
-        quirc_destroy(
-            q
-        );
-
-        return uart_install_err;
-    }
-
-    log_heap(
-        "after UART reinstall",
-        NULL,
-        NULL
-    );
-
-    uint8_t baud_value = 0;
-
-    if (
-        !scanner_baud_read(
-            uart_num,
-            &baud_value))
-    {
-        snprintf(
-            result->status,
-            sizeof(result->status),
-            "BAUD_READ_FAILED"
-        );
-
-        quirc_destroy(
-            q
-        );
-
-        return ESP_FAIL;
-    }
-
-    analyzer_diag_mark(
-        AD_BAUD_READ_OK,
-        (int32_t)baud_value
-    );
-
-    if (baud_value != 0x0B)
-    {
-        snprintf(
-            result->status,
-            sizeof(result->status),
-            "UNEXPECTED_START_BAUD"
-        );
-
-        snprintf(
-            result->detail,
-            sizeof(result->detail),
-            "Expected scanner at fixed product baud 115200"
-        );
-
-        quirc_destroy(
-            q
-        );
-
-        return ESP_FAIL;
-    }
-
-    /*
-     * v2.2.4 product policy: keep the QRCode2 at 115200 for both Normal and
-     * Analyzer modes. 128000 saved only ~4 seconds per analysis but added
-     * persistent-state and recovery complexity.
-     */
-    analyzer_diag_mark(
-        AD_BAUD_128_OK,
-        115200
-    );
-
-    /*
-     * Erase the RAW diagnostic area BEFORE requesting the image.
-     * The scanner starts streaming the 307200-byte body immediately after
-     * the 10-byte header. Erasing Flash after the header can block long
-     * enough to overflow the UART RX ring buffer and cause a body timeout.
-     */
-    esp_err_t raw_begin_err =
-        flash_store_raw_begin();
-
-    if (raw_begin_err != ESP_OK)
-    {
-        snprintf(
-            result->status,
-            sizeof(result->status),
-            "RAW_DUMP_ERASE_FAILED"
-        );
-
-        snprintf(
-            result->detail,
-            sizeof(result->detail),
-            "Unable to erase reserved RAW diagnostic Flash area before image request"
-        );
-
-        scanner_restore_115200(
-            uart_num
-        );
-
-        quirc_destroy(
-            q
-        );
-
-        return raw_begin_err;
-    }
-
-    uart_flush_input(
-        uart_num
-    );
-
-    uart_send(
-        uart_num,
-        CMD_IMAGE_RAW_640X480,
-        sizeof(CMD_IMAGE_RAW_640X480)
-    );
-
-    analyzer_diag_mark(
-        AD_IMAGE_REQUEST_SENT,
-        0
-    );
-
-    uint8_t command = 0;
-
-    if (
-        uart_read_exact(
-            uart_num,
-            &command,
-            1,
-            IMAGE_HEADER_TIMEOUT_MS) != 1 ||
-        command != 0x61)
-    {
-        snprintf(
-            result->status,
-            sizeof(result->status),
-            "IMAGE_REPLY_TIMEOUT"
-        );
-
-        scanner_restore_115200(
-            uart_num
-        );
-
-        quirc_destroy(
-            q
-        );
-
-        return ESP_ERR_TIMEOUT;
-    }
-
-    uint8_t first = 0;
-
-    if (
-        uart_read_exact(
-            uart_num,
-            &first,
-            1,
-            IMAGE_HEADER_TIMEOUT_MS) != 1)
-    {
-        snprintf(
-            result->status,
-            sizeof(result->status),
-            "IMAGE_HEADER_TIMEOUT"
-        );
-
-        scanner_restore_115200(
-            uart_num
-        );
-
-        quirc_destroy(
-            q
-        );
-
-        return ESP_ERR_TIMEOUT;
-    }
-
-    if (first == 0x00)
-    {
-        snprintf(
-            result->status,
-            sizeof(result->status),
-            "IMAGE_READ_REJECTED"
-        );
-
-        snprintf(
-            result->detail,
-            sizeof(result->detail),
-            "QRCode2 returned 61 00"
-        );
-
-        scanner_restore_115200(
-            uart_num
-        );
-
-        quirc_destroy(
-            q
-        );
-
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-
-    uint8_t header[10] = {0};
-
-    header[0] = first;
-
-    if (
-        uart_read_exact(
-            uart_num,
-            &header[1],
-            9,
-            IMAGE_HEADER_TIMEOUT_MS) != 9)
-    {
-        snprintf(
-            result->status,
-            sizeof(result->status),
-            "IMAGE_HEADER_TRUNCATED"
-        );
-
-        scanner_restore_115200(
-            uart_num
-        );
-
-        quirc_destroy(
-            q
-        );
-
-        return ESP_ERR_TIMEOUT;
-    }
-
-    result->image_width =
-        ((uint16_t)header[0] << 8) |
-        header[1];
-
-    result->image_height =
-        ((uint16_t)header[2] << 8) |
-        header[3];
-
-    result->image_type =
-        header[4];
-
-    result->image_bytes =
-        ((uint32_t)header[6] << 24) |
-        ((uint32_t)header[7] << 16) |
-        ((uint32_t)header[8] << 8) |
-        header[9];
-
-    result->image_supported =
-        true;
-
-    analyzer_diag_mark(
-        AD_IMAGE_HEADER_OK,
-        (int32_t)result->image_bytes
-    );
-
-    ESP_LOGI(
-        TAG,
-        "image header: %ux%u type=0x%02X bytes=%lu",
-        (unsigned)result->image_width,
-        (unsigned)result->image_height,
-        result->image_type,
-        (unsigned long)result->image_bytes
-    );
-
-    if (
-        result->image_width !=
-            ANALYZER_SOURCE_WIDTH ||
-        result->image_height !=
-            ANALYZER_SOURCE_HEIGHT ||
-        (result->image_type & 0x0F) != 0 ||
-        result->image_bytes !=
-            ANALYZER_SOURCE_BYTES)
-    {
-        snprintf(
-            result->status,
-            sizeof(result->status),
-            "IMAGE_FORMAT_UNEXPECTED"
-        );
-
-        scanner_restore_115200(
-            uart_num
-        );
-
-        quirc_destroy(
-            q
-        );
-
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-
-    UBaseType_t rx_stack_hwm =
-        uxTaskGetStackHighWaterMark(
-            NULL
-        );
-
-    ESP_LOGI(
-        TAG,
-        "Analyzer device_task stack high-water before image RX: %u",
-        (unsigned)rx_stack_hwm
-    );
-
-    analyzer_diag_mark(
-        AD_IMAGE_RX_START,
-        (int32_t)rx_stack_hwm
-    );
-
-    int64_t start_us =
-        esp_timer_get_time();
-
-    if (
-        !receive_image_downsampled(
-            uart_num,
-            image,
-            ANALYZER_QUIRC_BYTES))
-    {
-        snprintf(
-            result->status,
-            sizeof(result->status),
-            "IMAGE_BODY_TIMEOUT"
-        );
-
-        scanner_restore_115200(
-            uart_num
-        );
-
-        quirc_destroy(
-            q
-        );
-
-        return diag_fail(
-            AD_IMAGE_RX_START,
-            ESP_ERR_TIMEOUT
-        );
-    }
-
-    int64_t end_us =
-        esp_timer_get_time();
-
-    result->transfer_ms =
-        (end_us - start_us) /
-        1000;
-
-    result->image_received =
-        true;
-
-    esp_err_t raw_commit_err =
-        flash_store_raw_commit();
-
-    if (raw_commit_err != ESP_OK)
-    {
-        snprintf(
-            result->status,
-            sizeof(result->status),
-            "RAW_DUMP_COMMIT_FAILED"
-        );
-
-        snprintf(
-            result->detail,
-            sizeof(result->detail),
-            "RAW image received but diagnostic Flash commit failed"
-        );
-
-        quirc_destroy(
-            q
-        );
-
-        return raw_commit_err;
-    }
-
-    analyzer_diag_mark(
-        AD_IMAGE_RX_DONE,
-        (int32_t)result->transfer_ms
-    );
-
-    ESP_LOGI(
-        TAG,
-        "image transfer: %lld ms, %.1f bytes/s",
-        (long long)result->transfer_ms,
-        result->transfer_ms > 0
-            ? ((double)ANALYZER_SOURCE_BYTES *
-               1000.0 /
-               (double)result->transfer_ms)
-            : 0.0
-    );
-
-    ESP_LOGI(
-        TAG,
-        "analysis image first 16: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
-        image[0],
-        image[1],
-        image[2],
-        image[3],
-        image[4],
-        image[5],
-        image[6],
-        image[7],
-        image[8],
-        image[9],
-        image[10],
-        image[11],
-        image[12],
-        image[13],
-        image[14],
-        image[15]
-    );
-
-    /* Scanner remained at the fixed product baud 115200. */
-    bool baud_restored = true;
-
-    analyzer_diag_mark(
-        AD_BAUD_115_RESTORED,
-        115200
-    );
-
-    quirc_end(
-        q
-    );
-
-    analyzer_diag_mark(
-        AD_QUIRC_END_DONE,
-        0
-    );
-
-    result->detected_symbols =
-        quirc_count(
-            q
-        );
-
-    result->quirc_detected =
-        result->detected_symbols > 0;
-
-    if (result->detected_symbols > 0)
-    {
-        analyzer_diag_mark(
-            AD_SYMBOLS_FOUND,
-            result->detected_symbols
-        );
-    }
-
-    ESP_LOGI(
-        TAG,
-        "quirc detected_symbols=%d",
-        result->detected_symbols
-    );
-
-    if (
-        result->detected_symbols <= 0)
-    {
-        snprintf(
-            result->status,
-            sizeof(result->status),
-            "QUIRC_NO_SYMBOL"
-        );
-
-        snprintf(
-            result->detail,
-            sizeof(result->detail),
-            "RAW image received but quirc found no QR symbol"
-        );
-
-        quirc_destroy(
-            q
-        );
-
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    log_heap(
-        "before decode task",
-        &result->heap_before_decode,
-        &result->largest_before_decode
-    );
-
-    decode_task_ctx_t context = {
-        .q =
-            q,
-
-        .symbol_count =
-            result->detected_symbols,
-
-        .scanner_payload =
-            payload,
-
-        .scanner_payload_len =
-            payload_len,
-
-        .result =
-            result,
-
-        .notify_task =
-            xTaskGetCurrentTaskHandle(),
-
-        .source_offset_x =
-            ANALYZER_CROP_X,
-
-        .source_offset_y =
-            0,
-
-        .scale_num =
-            1,
-
-        .scale_den =
-            1
-    };
-
-    BaseType_t created =
-        xTaskCreate(
-            decode_task,
-            "qrt_quirc_decode",
-            DECODE_TASK_STACK_BYTES,
-            &context,
-            5,
-            NULL
-        );
-
-    if (created != pdPASS)
-    {
-        snprintf(
-            result->status,
-            sizeof(result->status),
-            "DECODE_TASK_OOM"
-        );
-
-        snprintf(
-            result->detail,
-            sizeof(result->detail),
-            "Unable to allocate quirc decode task stack"
-        );
-
-        quirc_destroy(
-            q
-        );
-
-        return ESP_ERR_NO_MEM;
-    }
-
-    analyzer_diag_mark(
-        AD_DECODE_TASK_CREATED,
-        0
-    );
-
-    uint32_t notified =
-        ulTaskNotifyTake(
-            pdTRUE,
-            pdMS_TO_TICKS(
-                DECODE_TASK_TIMEOUT_MS
-            )
-        );
-
-    if (notified == 0)
-    {
-        snprintf(
-            result->status,
-            sizeof(result->status),
-            "DECODE_TASK_TIMEOUT"
-        );
-
-        snprintf(
-            result->detail,
-            sizeof(result->detail),
-            "quirc decode task did not complete"
-        );
-
-        /*
-         * Do not destroy q here because a timed-out task could still hold it.
-         * A task timeout is not expected with a normal QR and indicates a
-         * severe internal failure. Return without reclaiming q rather than
-         * causing use-after-free.
-         */
-        return ESP_ERR_TIMEOUT;
-    }
-
-    analyzer_diag_mark(
-        AD_DECODE_DONE,
-        result->quirc_decoded ? 0 : (int32_t)ESP_FAIL
-    );
-
-    quirc_destroy(
-        q
-    );
-
-    analyzer_diag_mark(
-        AD_QUIRC_DESTROYED,
-        0
-    );
-
-    log_heap(
-        "after quirc destroy",
-        NULL,
-        NULL
-    );
-
-    /*
-     * If native 640x480 analysis found the QR but could not decode it, retain
-     * its native-coordinate corners and retry only the QR neighborhood at
-     * the scanner's full 640x480 resolution. This keeps the contiguous image
-     * allocation below the full-frame 307200-byte requirement.
-     */
-    if (
-        !result->quirc_decoded &&
-        result->quirc_detected)
-    {
-        esp_err_t crop_err =
-            run_native_crop_decode(
-                uart_num,
-                payload,
-                payload_len,
-                result
-            );
-
-        ESP_LOGI(
-            TAG,
-            "native crop retry result=%s status=%s",
-            esp_err_to_name(crop_err),
-            result->status
-        );
-    }
-
-    if (!baud_restored)
-    {
-        scanner_restore_115200(
-            uart_num
-        );
-    }
-
-    return
-        result->quirc_decoded
-            ? ESP_OK
-            : ESP_FAIL;
+    snprintf(result->status, sizeof(result->status),
+             result->quirc_detected ? "QUIRC_DECODE_FAILED" : "QUIRC_NO_SYMBOL");
+    snprintf(result->detail, sizeof(result->detail),
+             result->quirc_detected
+                 ? "Stock quirc detected QR geometry but decode remained inconclusive"
+                 : "Stock quirc found no QR at 320x240 or 480x360");
+    return result->quirc_detected ? ESP_FAIL : ESP_ERR_NOT_FOUND;
 }
 
 esp_err_t analyzer_mode_init(void)
@@ -3157,7 +2695,7 @@ esp_err_t analyzer_process_scan_metadata(
             "    \"image_bytes\": %lu,\n"
             "    \"analysis_width\": %u,\n"
             "    \"analysis_height\": %u,\n"
-            "    \"downsample\": \"CENTER_CROP_X20_NATIVE\",\n"
+            "    \"downsample\": \"QUIRC_320X240_THEN_480X360\",\n"
             "    \"native_crop_attempted\": %s,\n"
             "    \"native_crop_used\": %s,\n"
             "    \"crop\": [%d,%d,%d,%d],\n"
@@ -3181,6 +2719,21 @@ esp_err_t analyzer_process_scan_metadata(
             "    \"largest_after_quirc\": %u,\n"
             "    \"heap_before_decode\": %u,\n"
             "    \"largest_before_decode\": %u,\n"
+            "    \"binary_probe\": {\n"
+            "      \"attempted\": %s,\n"
+            "      \"ready\": %s,\n"
+            "      \"format\": \"PACKED_1BPP_MSB_FIRST\",\n"
+            "      \"otsu_threshold\": %u,\n"
+            "      \"bytes\": %u,\n"
+            "      \"histogram_ms\": %lld,\n"
+            "      \"pack_ms\": %lld,\n"
+            "      \"black_pixels\": %lu,\n"
+            "      \"checksum_fnv1a32\": \"%08lX\",\n"
+            "      \"heap_before\": %u,\n"
+            "      \"largest_before\": %u,\n"
+            "      \"heap_with_bitmap\": %u,\n"
+            "      \"largest_with_bitmap\": %u\n"
+            "    },\n"
             "    \"detail\": \"%s\"\n"
             "  }\n"
             "}\n",
@@ -3289,6 +2842,22 @@ esp_err_t analyzer_process_scan_metadata(
             (unsigned)image_result.largest_after_quirc,
             (unsigned)image_result.heap_before_decode,
             (unsigned)image_result.largest_before_decode,
+            image_result.binary_probe_attempted
+                ? "true"
+                : "false",
+            image_result.binary_probe_ready
+                ? "true"
+                : "false",
+            (unsigned)image_result.binary_otsu_threshold,
+            (unsigned)image_result.binary_bytes,
+            (long long)image_result.binary_histogram_ms,
+            (long long)image_result.binary_pack_ms,
+            (unsigned long)image_result.binary_black_pixels,
+            (unsigned long)image_result.binary_checksum,
+            (unsigned)image_result.heap_before_binary,
+            (unsigned)image_result.largest_before_binary,
+            (unsigned)image_result.heap_with_binary,
+            (unsigned)image_result.largest_with_binary,
             image_result.detail
         );
 

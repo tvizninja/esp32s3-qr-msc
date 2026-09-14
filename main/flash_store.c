@@ -16,10 +16,11 @@ static const char *TAG = "FLASH_STORE";
 #define RECORD_SLOT_SIZE        8192u
 #define RECORD_PAYLOAD_OFFSET   4096u
 
-#define RAW_RESERVED_SLOTS      40u
+#define RAW_RESERVED_SLOTS      44u
 #define RAW_RESERVED_BYTES      (RAW_RESERVED_SLOTS * RECORD_SLOT_SIZE)
 #define RAW_HEADER_BYTES        FLASH_SECTOR_SIZE
 #define RAW_MAGIC               0x31574152u  /* "RAW1" little-endian */
+#define BIN_MAGIC               0x314E4942u  /* "BIN1" little-endian */
 
 #define RECORD_MAGIC            0x31545251u  /* "QRT1" little-endian */
 #define RECORD_VERSION          1u
@@ -49,6 +50,8 @@ typedef struct {
     uint32_t length;
     uint32_t reserved0;
 } raw_header_t;
+
+typedef raw_header_t binary_header_t;
 
 static const esp_partition_t *store_partition = NULL;
 
@@ -277,6 +280,16 @@ static size_t raw_payload_offset(void)
         RAW_HEADER_BYTES;
 }
 
+static size_t binary_header_offset(void)
+{
+    return raw_payload_offset() + FLASH_STORE_RAW_BYTES;
+}
+
+static size_t binary_payload_offset(void)
+{
+    return binary_header_offset() + FLASH_SECTOR_SIZE;
+}
+
 
 esp_err_t flash_store_raw_begin(void)
 {
@@ -413,6 +426,66 @@ esp_err_t flash_store_raw_read(
         );
 }
 
+
+
+esp_err_t flash_store_binary_write(
+    size_t offset,
+    const uint8_t *data,
+    size_t length)
+{
+    if (store_partition == NULL || (length > 0 && data == NULL) ||
+        offset > FLASH_STORE_BINARY_BYTES ||
+        length > FLASH_STORE_BINARY_BYTES - offset)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return esp_partition_write(
+        store_partition,
+        binary_payload_offset() + offset,
+        data,
+        length
+    );
+}
+
+esp_err_t flash_store_binary_commit(void)
+{
+    if (store_partition == NULL) return ESP_ERR_INVALID_STATE;
+
+    binary_header_t header = {
+        .magic = BIN_MAGIC,
+        .width = FLASH_STORE_RAW_WIDTH,
+        .height = FLASH_STORE_RAW_HEIGHT,
+        .length = FLASH_STORE_BINARY_BYTES,
+        .reserved0 = 0xFFFFFFFFu
+    };
+
+    return esp_partition_write(
+        store_partition, binary_header_offset(), &header, sizeof(header));
+}
+
+bool flash_store_binary_available(void)
+{
+    if (store_partition == NULL) return false;
+    binary_header_t header;
+    if (esp_partition_read(store_partition, binary_header_offset(), &header, sizeof(header)) != ESP_OK)
+        return false;
+    return header.magic == BIN_MAGIC &&
+           header.width == FLASH_STORE_RAW_WIDTH &&
+           header.height == FLASH_STORE_RAW_HEIGHT &&
+           header.length == FLASH_STORE_BINARY_BYTES;
+}
+
+esp_err_t flash_store_binary_read(
+    size_t offset, uint8_t *buffer, size_t length)
+{
+    if (store_partition == NULL || buffer == NULL ||
+        offset > FLASH_STORE_BINARY_BYTES ||
+        length > FLASH_STORE_BINARY_BYTES - offset)
+        return ESP_ERR_INVALID_ARG;
+    if (!flash_store_binary_available()) return ESP_ERR_NOT_FOUND;
+    return esp_partition_read(store_partition, binary_payload_offset() + offset, buffer, length);
+}
 
 esp_err_t flash_store_init(void)
 {

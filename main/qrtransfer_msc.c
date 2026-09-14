@@ -13,6 +13,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 
 #include "tinyusb.h"
 #include "tusb.h"
@@ -24,6 +25,25 @@
 
 
 static const char *TAG = "QRTRANSFER";
+
+
+static const char *reset_reason_name(esp_reset_reason_t reason)
+{
+    switch (reason)
+    {
+        case ESP_RST_POWERON: return "POWERON";
+        case ESP_RST_EXT: return "EXT";
+        case ESP_RST_SW: return "SW";
+        case ESP_RST_PANIC: return "PANIC";
+        case ESP_RST_INT_WDT: return "INT_WDT";
+        case ESP_RST_TASK_WDT: return "TASK_WDT";
+        case ESP_RST_WDT: return "WDT";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT: return "BROWNOUT";
+        case ESP_RST_SDIO: return "SDIO";
+        default: return "UNKNOWN";
+    }
+}
 
 
 // ============================================================
@@ -152,9 +172,16 @@ static led_strip_handle_t status_led = NULL;
 #define RAW_FIRST_CLUSTER         (ANALYSIS_FIRST_CLUSTER + ANALYSIS_CLUSTER_COUNT)
 #define RAW_CLUSTER_COUNT         ((RAW_BMP_FILE_SIZE + CLUSTER_SIZE - 1u) / CLUSTER_SIZE)
 
+// DEBUG.TXT is generated at boot from reset reason + the last persistent
+// Analyzer breadcrumb. It remains available even when the previous Analyzer
+// run reset before QRINFO.TXT could be completed.
+#define DEBUG_FIRST_CLUSTER       (RAW_FIRST_CLUSTER + RAW_CLUSTER_COUNT)
+#define DEBUG_CLUSTER_COUNT       2u
+#define DEBUG_TEXT_MAX            (DEBUG_CLUSTER_COUNT * CLUSTER_SIZE)
+
 #define DATA_CLUSTER_COUNT        \
     (LOG_DIR_CLUSTER_COUNT + FILE_CLUSTER_COUNT + HISTORY_DATA_CLUSTERS + \
-     ANALYSIS_CLUSTER_COUNT + RAW_CLUSTER_COUNT)
+     ANALYSIS_CLUSTER_COUNT + RAW_CLUSTER_COUNT + DEBUG_CLUSTER_COUNT)
 
 #define TOTAL_SECTORS             \
     (DATA_START_SECTOR + DATA_CLUSTER_COUNT * SECTORS_PER_CLUSTER)
@@ -199,6 +226,10 @@ static const uint8_t utf8_bom[] = {
 
 static uint8_t *latest_payload = NULL;
 static size_t latest_payload_length = 1;
+
+// Boot-generated crash/debug report exposed as DEBUG.TXT in Analyzer mode.
+static char debug_text[DEBUG_TEXT_MAX];
+static size_t debug_text_length = 0;
 
 
 // ============================================================
@@ -1356,6 +1387,21 @@ static void rebuild_virtual_fat_metadata(void)
     }
 
 
+    if (analyzer_mode_enabled() && debug_text_length > 0)
+    {
+        for (uint16_t i = 0; i < DEBUG_CLUSTER_COUNT; ++i)
+        {
+            uint16_t cluster = DEBUG_FIRST_CLUSTER + i;
+            fat12_set(
+                cluster,
+                (i == DEBUG_CLUSTER_COUNT - 1)
+                    ? 0xFFF
+                    : (uint16_t)(cluster + 1)
+            );
+        }
+    }
+
+
     for (
         uint16_t i = 0;
         i < visible_log_count;
@@ -1458,6 +1504,23 @@ static void rebuild_virtual_fat_metadata(void)
                 RAW_BMP_FILE_SIZE
             );
         }
+    }
+
+
+    if (analyzer_mode_enabled() && debug_text_length > 0)
+    {
+        static const char debug_name[8] = {
+            'D','E','B','U','G',' ',' ',' '
+        };
+
+        make_entry(
+            root_directory + 160,
+            debug_name,
+            txt_ext,
+            0x21,
+            DEBUG_FIRST_CLUSTER,
+            (uint32_t)debug_text_length
+        );
     }
 
 
@@ -1963,6 +2026,34 @@ static esp_err_t virtual_disk_read_sector(
                 analyzer_result_json() + file_offset,
                 amount
             );
+        }
+
+        return ESP_OK;
+    }
+
+
+    // Boot/debug report. This is independent of analyzer_has_result() so it
+    // survives a reset that occurred before QRINFO.TXT was completed.
+    if (
+        analyzer_mode_enabled() &&
+        debug_text_length > 0 &&
+        cluster >= DEBUG_FIRST_CLUSTER &&
+        cluster < DEBUG_FIRST_CLUSTER + DEBUG_CLUSTER_COUNT
+    )
+    {
+        size_t file_offset =
+            (size_t)(cluster - DEBUG_FIRST_CLUSTER) * CLUSTER_SIZE +
+            sector_in_cluster * SECTOR_SIZE;
+
+        if (file_offset < debug_text_length)
+        {
+            size_t amount = debug_text_length - file_offset;
+            if (amount > SECTOR_SIZE)
+            {
+                amount = SECTOR_SIZE;
+            }
+
+            memcpy(sector, debug_text + file_offset, amount);
         }
 
         return ESP_OK;
@@ -4189,6 +4280,14 @@ static void device_task(
 
 void app_main(void)
 {
+    esp_reset_reason_t reset_reason = esp_reset_reason();
+    ESP_LOGW(
+        TAG,
+        "BOOT reset_reason=%d (%s)",
+        (int)reset_reason,
+        reset_reason_name(reset_reason)
+    );
+
     gpio_config_t button_config = {
         .pin_bit_mask =
             1ULL <<
@@ -4236,6 +4335,44 @@ void app_main(void)
             esp_err_to_name(mode_err)
         );
     }
+
+    if (analyzer_mode_enabled())
+    {
+        int written = snprintf(
+            debug_text,
+            sizeof(debug_text),
+            "QRTransfer Analyzer DEBUG\r\n"
+            "firmware_version=2.4.6\r\n"
+            "source_variant=qrtransfer_v2_4_6_stable_analyzer\r\n"
+            "reset_reason=%d\r\n"
+            "reset_reason_name=%s\r\n"
+            "operating_mode=ANALYZER\r\n",
+            (int)reset_reason,
+            reset_reason_name(reset_reason)
+        );
+
+        if (written > 0)
+        {
+            debug_text_length = (size_t)written;
+            if (debug_text_length >= sizeof(debug_text))
+            {
+                debug_text_length = sizeof(debug_text) - 1;
+            }
+
+            if (debug_text_length < sizeof(debug_text) - 1)
+            {
+                debug_text_length += analyzer_diag_format_last(
+                    debug_text + debug_text_length,
+                    sizeof(debug_text) - debug_text_length
+                );
+                if (debug_text_length >= sizeof(debug_text))
+                {
+                    debug_text_length = sizeof(debug_text) - 1;
+                }
+            }
+        }
+    }
+
 
     boot_action_t boot_action = boot_gesture_action();
 
@@ -4442,7 +4579,7 @@ void app_main(void)
     xTaskCreate(
         device_task,
         "device_task",
-        4096,
+        analyzer_mode_enabled() ? 8192 : 4096,
         NULL,
         5,
         NULL

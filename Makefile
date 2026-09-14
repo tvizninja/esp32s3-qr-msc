@@ -41,7 +41,7 @@ DOCKER_BUILD_INTERACTIVE = $(DOCKER) run --rm -it \
 	$(IDF_IMAGE)
 
 .PHONY: help doctor image build config-check clean fullclean reset-config reconfigure menuconfig size shell \
-	flash-tool flash-tool-clean flash erase-flash
+	flash-tool flash-tool-clean flash monitor erase-flash
 
 help:
 	@printf '%s\n' \
@@ -62,6 +62,7 @@ help:
 	  '  make flash PORT=/dev/ttyACM0' \
 	  '  make flash /dev/ttyACM0' \
 	  '    host runs espflash with sudo; Docker is not used while flashing' \
+	  '  Analyzer diagnostics: DEBUG.TXT on the MSC volume' \
 	  '' \
 	  'Host requirements:' \
 	  '  Linux + GNU Make + rootless Docker + sudo' \
@@ -111,7 +112,7 @@ image:
 # override sdkconfig.defaults. Validate the two product-critical settings both
 # before and after the build.
 build:
-	@echo 'SOURCE_VARIANT: qrtransfer_v2_4_6_clean_docs_fix8'
+	@echo 'SOURCE_VARIANT: qrtransfer_v2_4_6_stable_analyzer'
 	@awk '\
 		/^static void scanner_status_read_string\(/ { in_fn=1; next } \
 		in_fn && /^static / { exit } \
@@ -120,7 +121,7 @@ build:
 			bad=1 \
 		} \
 		END { exit bad ? 42 : 0 }' main/analyzer.c || { \
-		echo 'ERROR: This is not the FIX3 analyzer.c. Re-extract FIX3 and run make from that directory.' >&2; \
+		echo 'ERROR: Unexpected analyzer.c layout. Re-extract this source tree and run make from its directory.' >&2; \
 		exit 2; \
 	}
 	@if [ -f "$(PROJECT_DIR)/sdkconfig" ]; then \
@@ -329,6 +330,11 @@ flash:
 
 /dev/%:
 	@:
+
+monitor:
+	@echo 'ERROR: USB serial monitor is disabled in this TinyUSB MSC build.' >&2
+	@echo 'Use DEBUG.TXT after reboot, or a separate external UART adapter for live logs.' >&2
+	@exit 2
 
 erase-flash:
 	$(CHECK_PORT)
