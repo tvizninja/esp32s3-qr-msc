@@ -112,7 +112,7 @@ image:
 # override sdkconfig.defaults. Validate the two product-critical settings both
 # before and after the build.
 build:
-	@echo 'SOURCE_VARIANT: qrtransfer_v2_4_6_stable_analyzer'
+	@echo 'SOURCE_VARIANT: qrtransfer_v2_4_6_zxing_fix_exp31'
 	@awk '\
 		/^static void scanner_status_read_string\(/ { in_fn=1; next } \
 		in_fn && /^static / { exit } \

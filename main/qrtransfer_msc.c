@@ -161,7 +161,7 @@ static led_strip_handle_t status_led = NULL;
 #define ANALYSIS_FIRST_CLUSTER    \
     (HISTORY_FIRST_CLUSTER + HISTORY_DATA_CLUSTERS)
 
-#define ANALYSIS_CLUSTER_COUNT    4u
+#define ANALYSIS_CLUSTER_COUNT    ((ANALYZER_JSON_MAX + CLUSTER_SIZE - 1u) / CLUSTER_SIZE)
 
 // Analyzer image is exposed as an uncompressed 8-bit grayscale BMP.
 // BITMAPFILEHEADER (14) + BITMAPINFOHEADER (40) + 256-entry BGRA palette.
@@ -646,22 +646,20 @@ static void status_analyzing(void)
 // Analyzer activity indication
 //
 // During the long RAW transfer / decode phase, alternate:
-//   purple 1 s -> green 1 s -> repeat
+//   purple 0.5 s -> green 0.5 s -> repeat
 // so the user can distinguish active work from a stuck solid LED.
 // ============================================================
 
 static bool analyzer_progress_purple = true;
+static esp_timer_handle_t analyzer_heartbeat_timer = NULL;
+
+#define ANALYZER_HEARTBEAT_INTERVAL_US  (500 * 1000ULL)
 
 
-static void analyzer_activity_start(void)
+static void analyzer_heartbeat_timer_cb(void *arg)
 {
-    analyzer_progress_purple = true;
-    status_analyzing();
-}
+    (void)arg;
 
-
-void analyzer_progress_hook(void)
-{
     if (analyzer_progress_purple)
     {
         status_success();
@@ -671,13 +669,59 @@ void analyzer_progress_hook(void)
         status_analyzing();
     }
 
-    analyzer_progress_purple =
-        !analyzer_progress_purple;
+    analyzer_progress_purple = !analyzer_progress_purple;
+}
+
+
+static void analyzer_activity_start(void)
+{
+    analyzer_progress_purple = true;
+    status_analyzing();
+
+    if (analyzer_heartbeat_timer == NULL)
+    {
+        const esp_timer_create_args_t args = {
+            .callback = analyzer_heartbeat_timer_cb,
+            .arg = NULL,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "analyzer_led",
+            .skip_unhandled_events = true,
+        };
+
+        if (esp_timer_create(&args, &analyzer_heartbeat_timer) != ESP_OK)
+        {
+            analyzer_heartbeat_timer = NULL;
+            return;
+        }
+    }
+
+    (void)esp_timer_stop(analyzer_heartbeat_timer);
+    (void)esp_timer_start_periodic(
+        analyzer_heartbeat_timer,
+        ANALYZER_HEARTBEAT_INTERVAL_US
+    );
+}
+
+
+void analyzer_progress_hook(void)
+{
+    /*
+     * The visible heartbeat is driven by an independent esp_timer so it
+     * continues even while a decoder spends hundreds of milliseconds in a
+     * single call.  Keep this hook as a cooperative yield point for the
+     * existing long row/transfer loops.
+     */
+    taskYIELD();
 }
 
 
 static void analyzer_activity_stop(void)
 {
+    if (analyzer_heartbeat_timer != NULL)
+    {
+        (void)esp_timer_stop(analyzer_heartbeat_timer);
+    }
+
     status_analyzing();
 }
 
@@ -4343,7 +4387,7 @@ void app_main(void)
             sizeof(debug_text),
             "QRTransfer Analyzer DEBUG\r\n"
             "firmware_version=2.4.6\r\n"
-            "source_variant=qrtransfer_v2_4_6_stable_analyzer\r\n"
+            "source_variant=qrtransfer_v2_4_6_zxing_fix_exp31\r\n"
             "reset_reason=%d\r\n"
             "reset_reason_name=%s\r\n"
             "operating_mode=ANALYZER\r\n",
@@ -4579,7 +4623,7 @@ void app_main(void)
     xTaskCreate(
         device_task,
         "device_task",
-        analyzer_mode_enabled() ? 8192 : 4096,
+        analyzer_mode_enabled() ? 16384 : 4096,
         NULL,
         5,
         NULL

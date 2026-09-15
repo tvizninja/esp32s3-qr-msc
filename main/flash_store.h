@@ -110,6 +110,8 @@ esp_err_t flash_store_raw_read(
 );
 
 /* Analyzer packed 1bpp diagnostic storage. */
+esp_err_t flash_store_binary_begin(void);
+
 esp_err_t flash_store_binary_write(
     size_t offset,
     const uint8_t *data,

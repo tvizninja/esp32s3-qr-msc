@@ -12,6 +12,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "quirc.h"
+#include "zxing_qr_packed.h"
 #include "flash_store.h"
 
 static const char *TAG = "ANALYZER";
@@ -165,6 +166,49 @@ typedef struct
     size_t largest_with_binary;
     uint32_t binary_black_pixels;
     uint32_t binary_checksum;
+    int64_t binary_hybrid_ms;
+    uint32_t binary_hybrid_black_pixels;
+    uint32_t binary_hybrid_checksum;
+
+    bool zxing_attempted;
+    bool zxing_decoded;
+    bool zxing_payload_match;
+    int zxing_finder_patterns;
+    int zxing_candidate_sets;
+    int zxing_decode_attempts;
+    int zxing_version;
+    size_t zxing_payload_bytes;
+    int64_t zxing_decode_ms;
+    size_t zxing_heap_before;
+    size_t zxing_largest_before;
+    size_t zxing_heap_with_bitmap;
+    size_t zxing_largest_with_bitmap;
+    size_t zxing_heap_after_decode;
+    size_t zxing_largest_after_decode;
+    char zxing_ecc[8];
+    char zxing_status[32];
+    zxing_qr_packed_result_t zxing_meta;
+
+    bool zxing_hybrid_attempted;
+    bool zxing_hybrid_decoded;
+    bool zxing_hybrid_payload_match;
+    int zxing_hybrid_finder_patterns;
+    int zxing_hybrid_candidate_sets;
+    int zxing_hybrid_decode_attempts;
+    int zxing_hybrid_version;
+    size_t zxing_hybrid_payload_bytes;
+    int64_t zxing_hybrid_decode_ms;
+    size_t zxing_hybrid_heap_before;
+    size_t zxing_hybrid_largest_before;
+    size_t zxing_hybrid_heap_with_bitmap;
+    size_t zxing_hybrid_largest_with_bitmap;
+    size_t zxing_hybrid_heap_after_decode;
+    size_t zxing_hybrid_largest_after_decode;
+    UBaseType_t stack_hwm_before_zxing;
+    UBaseType_t stack_hwm_after_zxing;
+    char zxing_hybrid_ecc[8];
+    char zxing_hybrid_status[32];
+    zxing_qr_packed_result_t zxing_hybrid_meta;
 
     char status[64];
     char detail[192];
@@ -195,6 +239,80 @@ static esp_err_t analyzer_capture_raw_only(
 );
 
 static esp_err_t analyzer_binary_probe(
+    image_analysis_t *result
+);
+
+static void json_escape_small(const char *src, char *dst, size_t dst_size)
+{
+    if (!dst || dst_size == 0) return;
+    size_t w = 0;
+    if (!src) src = "";
+    for (size_t i = 0; src[i] != '\0' && w + 1 < dst_size; ++i) {
+        unsigned char c = (unsigned char)src[i];
+        if ((c == '"' || c == '\\') && w + 2 < dst_size) {
+            dst[w++] = '\\';
+            dst[w++] = (char)c;
+        } else if (c >= 0x20) {
+            dst[w++] = (char)c;
+        }
+    }
+    dst[w] = '\0';
+}
+
+static void format_zxing_metadata_json(const zxing_qr_packed_result_t *r, char *buf, size_t buf_size)
+{
+    if (!r || !buf || buf_size == 0) return;
+    char eci_json[128] = "[]";
+    if (r->has_eci) {
+        size_t used = 0;
+        used += snprintf(eci_json + used, sizeof(eci_json) - used, "[");
+        int n = r->eci_count > ZXING_QR_MAX_ECI_VALUES ? ZXING_QR_MAX_ECI_VALUES : r->eci_count;
+        for (int i = 0; i < n && used < sizeof(eci_json); ++i)
+            used += snprintf(eci_json + used, sizeof(eci_json) - used, "%s%d", i ? "," : "", r->eci_values[i]);
+        if (used < sizeof(eci_json)) snprintf(eci_json + used, sizeof(eci_json) - used, "]");
+    }
+    char sa_id[48], err_msg[192], err_loc[192], sym_id[32], ctype[32], dtype[32];
+    json_escape_small(r->structured_append_id, sa_id, sizeof(sa_id));
+    json_escape_small(r->error_message, err_msg, sizeof(err_msg));
+    json_escape_small(r->error_location, err_loc, sizeof(err_loc));
+    json_escape_small(r->symbology_identifier, sym_id, sizeof(sym_id));
+    json_escape_small(r->content_type, ctype, sizeof(ctype));
+    json_escape_small(r->data_type, dtype, sizeof(dtype));
+    bool sa_present = r->structured_append_index >= 0 && r->structured_append_count > 0;
+    snprintf(buf, buf_size,
+        "{\n"
+        "        \"mask\": %d,\n"
+        "        \"format_info\": {\"raw_data\":%d,\"hamming_distance\":%d,\"bits_index\":%d,\"mirrored\":%s},\n"
+        "        \"content_type\": \"%s\",\n"
+        "        \"data_type\": \"%s\",\n"
+        "        \"codec_mode_mask\": \"0x%08lX\",\n"
+        "        \"has_eci\": %s,\n"
+        "        \"eci_values\": %s,\n"
+        "        \"structured_append\": {\"present\":%s,\"index\":%d,\"count\":%d,\"id\":\"%s\"},\n"
+        "        \"symbology_identifier\": \"%s\",\n"
+        "        \"reader_init\": %s,\n"
+        "        \"unused_error_correction_margin\": %.3f,\n"
+        "        \"corners\": [[%d,%d],[%d,%d],[%d,%d],[%d,%d]],\n"
+        "        \"error\": {\"code\":%d,\"type\":\"%s\",\"message\":\"%s\",\"location\":\"%s\"}\n"
+        "      }",
+        r->mask, r->format_data_raw, r->format_hamming_distance, r->format_bits_index,
+        r->mirrored ? "true" : "false", ctype, dtype, (unsigned long)r->codec_mode_mask,
+        r->has_eci ? "true" : "false", eci_json, sa_present ? "true" : "false",
+        r->structured_append_index, r->structured_append_count, sa_id, sym_id,
+        r->reader_init ? "true" : "false", r->unused_error_correction_margin,
+        r->corners[0][0], r->corners[0][1], r->corners[1][0], r->corners[1][1],
+        r->corners[2][0], r->corners[2][1], r->corners[3][0], r->corners[3][1],
+        r->error_type, r->error_type_name, err_msg, err_loc);
+}
+
+static esp_err_t analyzer_zxing_packed_probe(
+    const uint8_t *scanner_payload,
+    size_t scanner_payload_len,
+    image_analysis_t *result,
+    bool hybrid
+);
+
+static esp_err_t analyzer_binary_hybrid_probe(
     image_analysis_t *result
 );
 
@@ -2060,6 +2178,228 @@ static esp_err_t analyzer_binary_probe(
 }
 
 
+
+/* Compact Hybrid binarizer derived from ZXing-C++ HybridBinarizer. */
+static esp_err_t analyzer_binary_hybrid_probe(image_analysis_t *result)
+{
+    enum { BLOCK = 8, SUB_W = ANALYZER_SOURCE_WIDTH / BLOCK,
+           SUB_H = ANALYZER_SOURCE_HEIGHT / BLOCK, RANGE = 24, R = 2 };
+
+    static uint8_t thresholds[SUB_W * SUB_H];
+    static uint8_t smooth[SUB_W * SUB_H];
+    static uint8_t rows[BLOCK][ANALYZER_SOURCE_WIDTH];
+    static uint8_t packed_rows[BLOCK][ANALYZER_BINARY_ROW_BYTES];
+
+    if (!result) return ESP_ERR_INVALID_ARG;
+
+    int64_t t0 = esp_timer_get_time();
+    memset(thresholds, 0, sizeof(thresholds));
+    memset(smooth, 0, sizeof(smooth));
+
+    for (int by = 0; by < SUB_H; ++by) {
+        size_t y0 = (size_t)by * BLOCK;
+        for (int yy = 0; yy < BLOCK; ++yy) {
+            esp_err_t err = flash_store_raw_read((y0 + yy) * ANALYZER_SOURCE_WIDTH,
+                                                 rows[yy], ANALYZER_SOURCE_WIDTH);
+            if (err != ESP_OK) return err;
+        }
+        for (int bx = 0; bx < SUB_W; ++bx) {
+            uint8_t mn = 255, mx = 0;
+            int x0 = bx * BLOCK;
+            for (int yy = 0; yy < BLOCK; ++yy) {
+                for (int xx = 0; xx < BLOCK; ++xx) {
+                    uint8_t v = rows[yy][x0 + xx];
+                    if (v < mn) mn = v;
+                    if (v > mx) mx = v;
+                }
+            }
+            thresholds[by * SUB_W + bx] =
+                ((int)mx - (int)mn > RANGE) ? (uint8_t)(((int)mx + mn) / 2) : 0;
+        }
+        if ((by & 7) == 7) {
+            analyzer_progress_hook();
+            taskYIELD();
+        }
+    }
+
+    for (int by = 0; by < SUB_H; ++by) {
+        for (int bx = 0; bx < SUB_W; ++bx) {
+            int left = bx < R ? R : (bx > SUB_W - R - 1 ? SUB_W - R - 1 : bx);
+            int top = by < R ? R : (by > SUB_H - R - 1 ? SUB_H - R - 1 : by);
+            int center = thresholds[by * SUB_W + bx];
+            int sum = center * 2;
+            int n = center > 0 ? 2 : 0;
+            for (int dy = -R; dy <= R; ++dy) {
+                for (int dx = -R; dx <= R; ++dx) {
+                    int v = thresholds[(top + dy) * SUB_W + (left + dx)];
+                    sum += v;
+                    n += v > 0;
+                }
+            }
+            smooth[by * SUB_W + bx] = n > 0 ? (uint8_t)(sum / n) : 0;
+        }
+    }
+
+    int last = -1;
+    const int count = SUB_W * SUB_H;
+    for (int i = 0; i < count; ++i) {
+        if (smooth[i] != 0) {
+            if (last + 1 < i)
+                memset(&smooth[last + 1], smooth[i], (size_t)(i - last - 1));
+            last = i;
+        }
+    }
+    if (last >= 0 && last + 1 < count)
+        memset(&smooth[last + 1], smooth[last], (size_t)(count - last - 1));
+
+    const bool global_fallback = last < 0;
+
+    esp_err_t begin_err = flash_store_binary_begin();
+    if (begin_err != ESP_OK) return begin_err;
+
+    uint32_t black = 0;
+    uint32_t checksum = 2166136261u;
+    for (int by = 0; by < SUB_H; ++by) {
+        size_t y0 = (size_t)by * BLOCK;
+        for (int yy = 0; yy < BLOCK; ++yy) {
+            esp_err_t err = flash_store_raw_read((y0 + yy) * ANALYZER_SOURCE_WIDTH,
+                                                 rows[yy], ANALYZER_SOURCE_WIDTH);
+            if (err != ESP_OK) return err;
+            memset(packed_rows[yy], 0, ANALYZER_BINARY_ROW_BYTES);
+        }
+        for (int bx = 0; bx < SUB_W; ++bx) {
+            uint8_t threshold = global_fallback
+                ? result->binary_otsu_threshold
+                : smooth[by * SUB_W + bx];
+            int x0 = bx * BLOCK;
+            for (int yy = 0; yy < BLOCK; ++yy) {
+                for (int xx = 0; xx < BLOCK; ++xx) {
+                    int x = x0 + xx;
+                    if (rows[yy][x] <= threshold) {
+                        packed_rows[yy][x >> 3] |= (uint8_t)(0x80u >> (x & 7));
+                        ++black;
+                    }
+                }
+            }
+        }
+        for (int yy = 0; yy < BLOCK; ++yy) {
+            for (size_t i = 0; i < ANALYZER_BINARY_ROW_BYTES; ++i) {
+                checksum ^= packed_rows[yy][i];
+                checksum *= 16777619u;
+            }
+            esp_err_t err = flash_store_binary_write((y0 + yy) * ANALYZER_BINARY_ROW_BYTES,
+                                                     packed_rows[yy], ANALYZER_BINARY_ROW_BYTES);
+            if (err != ESP_OK) return err;
+        }
+        if ((by & 7) == 7) {
+            analyzer_progress_hook();
+            taskYIELD();
+        }
+    }
+
+    esp_err_t commit_err = flash_store_binary_commit();
+    if (commit_err != ESP_OK) return commit_err;
+
+    result->binary_hybrid_ms = (esp_timer_get_time() - t0) / 1000;
+    result->binary_hybrid_black_pixels = black;
+    result->binary_hybrid_checksum = checksum;
+    return ESP_OK;
+}
+
+static esp_err_t analyzer_zxing_packed_probe(
+    const uint8_t *scanner_payload,
+    size_t scanner_payload_len,
+    image_analysis_t *result,
+    bool hybrid)
+{
+    if (!result) return ESP_ERR_INVALID_ARG;
+
+    bool *attempted = hybrid ? &result->zxing_hybrid_attempted : &result->zxing_attempted;
+    bool *decoded = hybrid ? &result->zxing_hybrid_decoded : &result->zxing_decoded;
+    bool *payload_match = hybrid ? &result->zxing_hybrid_payload_match : &result->zxing_payload_match;
+    int *finder_patterns = hybrid ? &result->zxing_hybrid_finder_patterns : &result->zxing_finder_patterns;
+    int *candidate_sets = hybrid ? &result->zxing_hybrid_candidate_sets : &result->zxing_candidate_sets;
+    int *decode_attempts = hybrid ? &result->zxing_hybrid_decode_attempts : &result->zxing_decode_attempts;
+    int *version = hybrid ? &result->zxing_hybrid_version : &result->zxing_version;
+    size_t *payload_bytes = hybrid ? &result->zxing_hybrid_payload_bytes : &result->zxing_payload_bytes;
+    int64_t *decode_ms = hybrid ? &result->zxing_hybrid_decode_ms : &result->zxing_decode_ms;
+    size_t *heap_before = hybrid ? &result->zxing_hybrid_heap_before : &result->zxing_heap_before;
+    size_t *largest_before = hybrid ? &result->zxing_hybrid_largest_before : &result->zxing_largest_before;
+    size_t *heap_with_bitmap = hybrid ? &result->zxing_hybrid_heap_with_bitmap : &result->zxing_heap_with_bitmap;
+    size_t *largest_with_bitmap = hybrid ? &result->zxing_hybrid_largest_with_bitmap : &result->zxing_largest_with_bitmap;
+    size_t *heap_after_decode = hybrid ? &result->zxing_hybrid_heap_after_decode : &result->zxing_heap_after_decode;
+    size_t *largest_after_decode = hybrid ? &result->zxing_hybrid_largest_after_decode : &result->zxing_largest_after_decode;
+    char *ecc = hybrid ? result->zxing_hybrid_ecc : result->zxing_ecc;
+    size_t ecc_size = hybrid ? sizeof(result->zxing_hybrid_ecc) : sizeof(result->zxing_ecc);
+    char *status = hybrid ? result->zxing_hybrid_status : result->zxing_status;
+    size_t status_size = hybrid ? sizeof(result->zxing_hybrid_status) : sizeof(result->zxing_status);
+
+    *attempted = true;
+    snprintf(status, status_size, "STARTING");
+
+    if (!flash_store_binary_available()) {
+        snprintf(status, status_size, "NO_1BPP");
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    log_heap(hybrid ? "before ZXing Hybrid packed bitmap" : "before ZXing Otsu packed bitmap",
+             heap_before, largest_before);
+
+    uint8_t *packed = heap_caps_malloc(ANALYZER_BINARY_BYTES, MALLOC_CAP_8BIT);
+    if (!packed) {
+        snprintf(status, status_size, "BITMAP_OOM");
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t read_err = flash_store_binary_read(0, packed, ANALYZER_BINARY_BYTES);
+    if (read_err != ESP_OK) {
+        heap_caps_free(packed);
+        snprintf(status, status_size, "BITMAP_READ_FAIL");
+        return read_err;
+    }
+
+    log_heap(hybrid ? "with ZXing Hybrid packed bitmap" : "with ZXing Otsu packed bitmap",
+             heap_with_bitmap, largest_with_bitmap);
+
+    zxing_qr_packed_result_t zr = {0};
+    int64_t t0 = esp_timer_get_time();
+    int zrc = zxing_qr_decode_packed(
+        packed,
+        ANALYZER_SOURCE_WIDTH,
+        ANALYZER_SOURCE_HEIGHT,
+        ANALYZER_BINARY_ROW_BYTES,
+        scanner_payload,
+        scanner_payload_len,
+        &zr);
+    *decode_ms = (esp_timer_get_time() - t0) / 1000;
+
+    if (hybrid) result->zxing_hybrid_meta = zr;
+    else result->zxing_meta = zr;
+
+    *decoded = zr.decoded;
+    *payload_match = zr.payload_match;
+    *finder_patterns = zr.finder_patterns;
+    *candidate_sets = zr.candidate_sets;
+    *decode_attempts = zr.decode_attempts;
+    *version = zr.version;
+    *payload_bytes = zr.payload_bytes;
+    snprintf(ecc, ecc_size, "%s", zr.ecc);
+    snprintf(status, status_size, "%s", zr.status);
+
+    log_heap(hybrid ? "after ZXing Hybrid packed decode" : "after ZXing Otsu packed decode",
+             heap_after_decode, largest_after_decode);
+
+    heap_caps_free(packed);
+
+    ESP_LOGI(TAG,
+             "ZXing %s packed: rc=%d status=%s decoded=%d match=%d finders=%d sets=%d attempts=%d v=%d bytes=%u ms=%lld",
+             hybrid ? "Hybrid" : "Otsu", zrc, status, *decoded, *payload_match,
+             *finder_patterns, *candidate_sets, *decode_attempts, *version,
+             (unsigned)*payload_bytes, (long long)*decode_ms);
+
+    return *decoded ? ESP_OK : ESP_FAIL;
+}
+
 static esp_err_t fill_quirc_image_from_raw_flash(
     uint8_t *dst,
     int dst_width,
@@ -2254,6 +2594,25 @@ static esp_err_t analyze_image(
         snprintf(result->status, sizeof(result->status), "UART_RELEASE_FAILED");
         return uart_delete_err;
     }
+
+    /* Compare stock ZXing QR on two compact 1bpp preprocessors. */
+    result->stack_hwm_before_zxing = uxTaskGetStackHighWaterMark(NULL);
+
+    esp_err_t zxing_err = analyzer_zxing_packed_probe(payload, payload_len, result, false);
+    if (zxing_err != ESP_OK)
+        ESP_LOGW(TAG, "ZXing Otsu packed QR probe did not decode: %s", result->zxing_status);
+
+    esp_err_t hybrid_err = analyzer_binary_hybrid_probe(result);
+    if (hybrid_err == ESP_OK) {
+        esp_err_t zxing_hybrid_err = analyzer_zxing_packed_probe(payload, payload_len, result, true);
+        if (zxing_hybrid_err != ESP_OK)
+            ESP_LOGW(TAG, "ZXing Hybrid packed QR probe did not decode: %s", result->zxing_hybrid_status);
+    } else {
+        snprintf(result->zxing_hybrid_status, sizeof(result->zxing_hybrid_status), "BINARIZE_FAIL");
+        ESP_LOGW(TAG, "Compact Hybrid binarization failed: %s", esp_err_to_name(hybrid_err));
+    }
+
+    result->stack_hwm_after_zxing = uxTaskGetStackHighWaterMark(NULL);
 
     log_heap("before quirc resolution ladder",
              &result->heap_before_quirc,
@@ -2500,6 +2859,20 @@ size_t analyzer_result_json_length(void)
     return s_json_len;
 }
 
+static void bytes_to_hex_compact(const uint8_t *data, size_t len, char *out, size_t out_size)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    if (out == NULL || out_size == 0) return;
+    out[0] = '\0';
+    if (data == NULL) return;
+    if (len > (out_size - 1) / 2) len = (out_size - 1) / 2;
+    for (size_t i = 0; i < len; ++i) {
+        out[i * 2] = hex[data[i] >> 4];
+        out[i * 2 + 1] = hex[data[i] & 0x0F];
+    }
+    out[len * 2] = '\0';
+}
+
 bool analyzer_has_result(void)
 {
     return
@@ -2635,6 +3008,30 @@ esp_err_t analyzer_process_scan_metadata(
         0
     );
 
+    char *zxing_meta_json = heap_caps_malloc(4096, MALLOC_CAP_8BIT);
+    if (zxing_meta_json == NULL)
+    {
+        heap_caps_free(scanner_identity_json);
+        return ESP_ERR_NO_MEM;
+    }
+    char *zxing_hybrid_meta_json = zxing_meta_json + 2048;
+    format_zxing_metadata_json(&image_result.zxing_meta, zxing_meta_json, 2048);
+    format_zxing_metadata_json(&image_result.zxing_hybrid_meta, zxing_hybrid_meta_json, 2048);
+
+    if (payload_len > (SIZE_MAX - 1) / 2) {
+        heap_caps_free(zxing_meta_json);
+        heap_caps_free(scanner_identity_json);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    size_t payload_hex_size = payload_len * 2 + 1;
+    char *payload_hex = heap_caps_malloc(payload_hex_size, MALLOC_CAP_8BIT);
+    if (payload_hex == NULL) {
+        heap_caps_free(zxing_meta_json);
+        heap_caps_free(scanner_identity_json);
+        return ESP_ERR_NO_MEM;
+    }
+    bytes_to_hex_compact(payload, payload_len, payload_hex, payload_hex_size);
+
     s_json =
         heap_caps_malloc(
             ANALYZER_JSON_MAX,
@@ -2643,6 +3040,8 @@ esp_err_t analyzer_process_scan_metadata(
 
     if (s_json == NULL)
     {
+        heap_caps_free(payload_hex);
+        heap_caps_free(zxing_meta_json);
         heap_caps_free(
             scanner_identity_json
         );
@@ -2670,6 +3069,7 @@ esp_err_t analyzer_process_scan_metadata(
             "    \"protocol_format3_detected\": %s,\n"
             "    \"crc_valid\": %s,\n"
             "    \"payload_bytes\": %u,\n"
+            "    \"payload_hex\": \"%s\",\n"
             "    \"barcode_count\": %u,\n"
             "    \"code_id\": %u,\n"
             "    \"code_id_hex\": \"0x%04X\",\n"
@@ -2711,6 +3111,8 @@ esp_err_t analyzer_process_scan_metadata(
             "    \"eci\": %lu,\n"
             "    \"decoded_payload_bytes\": %u,\n"
             "    \"payload_match_scanner\": %s,\n"
+            "    \"payload_hex\": \"%s\",\n"
+            "    \"payload_hex_source\": \"%s\",\n"
             "    \"corners\": [[%d,%d],[%d,%d],[%d,%d],[%d,%d]],\n"
             "    \"corners_analysis\": [[%d,%d],[%d,%d],[%d,%d],[%d,%d]],\n"
             "    \"heap_before_quirc\": %u,\n"
@@ -2729,11 +3131,60 @@ esp_err_t analyzer_process_scan_metadata(
             "      \"pack_ms\": %lld,\n"
             "      \"black_pixels\": %lu,\n"
             "      \"checksum_fnv1a32\": \"%08lX\",\n"
+            "      \"hybrid_ms\": %lld,\n"
+            "      \"hybrid_black_pixels\": %lu,\n"
+            "      \"hybrid_checksum_fnv1a32\": \"%08lX\",\n"
             "      \"heap_before\": %u,\n"
             "      \"largest_before\": %u,\n"
             "      \"heap_with_bitmap\": %u,\n"
             "      \"largest_with_bitmap\": %u\n"
             "    },\n"
+            "    \"zxing_otsu\": {\n"
+            "      \"attempted\": %s,\n"
+            "      \"decoded\": %s,\n"
+            "      \"status\": \"%s\",\n"
+            "      \"decode_ms\": %lld,\n"
+            "      \"finder_patterns\": %d,\n"
+            "      \"candidate_sets\": %d,\n"
+            "      \"decode_attempts\": %d,\n"
+            "      \"version\": %d,\n"
+            "      \"ecc\": \"%s\",\n"
+            "      \"decoded_payload_bytes\": %u,\n"
+            "      \"payload_match_scanner\": %s,\n"
+            "      \"payload_hex\": \"%s\",\n"
+            "      \"payload_hex_source\": \"%s\",\n"
+            "      \"metadata\": %s,\n"
+            "      \"heap_before\": %u,\n"
+            "      \"largest_before\": %u,\n"
+            "      \"heap_with_bitmap\": %u,\n"
+            "      \"largest_with_bitmap\": %u,\n"
+            "      \"heap_after_decode\": %u,\n"
+            "      \"largest_after_decode\": %u\n"
+            "    },\n"
+            "    \"zxing_hybrid\": {\n"
+            "      \"attempted\": %s,\n"
+            "      \"decoded\": %s,\n"
+            "      \"status\": \"%s\",\n"
+            "      \"decode_ms\": %lld,\n"
+            "      \"finder_patterns\": %d,\n"
+            "      \"candidate_sets\": %d,\n"
+            "      \"decode_attempts\": %d,\n"
+            "      \"version\": %d,\n"
+            "      \"ecc\": \"%s\",\n"
+            "      \"decoded_payload_bytes\": %u,\n"
+            "      \"payload_match_scanner\": %s,\n"
+            "      \"payload_hex\": \"%s\",\n"
+            "      \"payload_hex_source\": \"%s\",\n"
+            "      \"metadata\": %s,\n"
+            "      \"heap_before\": %u,\n"
+            "      \"largest_before\": %u,\n"
+            "      \"heap_with_bitmap\": %u,\n"
+            "      \"largest_with_bitmap\": %u,\n"
+            "      \"heap_after_decode\": %u,\n"
+            "      \"largest_after_decode\": %u\n"
+            "    },\n"
+            "    \"analyzer_stack_hwm_before_zxing\": %u,\n"
+            "    \"analyzer_stack_hwm_after_zxing\": %u,\n"
             "    \"detail\": \"%s\"\n"
             "  }\n"
             "}\n",
@@ -2764,6 +3215,7 @@ esp_err_t analyzer_process_scan_metadata(
                 ? "true"
                 : "false",
             (unsigned)payload_len,
+            payload_hex,
             (unsigned)barcode_count,
             (unsigned)code_id,
             (unsigned)code_id,
@@ -2820,6 +3272,8 @@ esp_err_t analyzer_process_scan_metadata(
             image_result.payload_match
                 ? "true"
                 : "false",
+            image_result.payload_match ? payload_hex : "",
+            image_result.payload_match ? "SCANNER_MATCH" : "UNAVAILABLE_ON_MISMATCH",
             image_result.corners[0][0],
             image_result.corners[0][1],
             image_result.corners[1][0],
@@ -2854,10 +3308,55 @@ esp_err_t analyzer_process_scan_metadata(
             (long long)image_result.binary_pack_ms,
             (unsigned long)image_result.binary_black_pixels,
             (unsigned long)image_result.binary_checksum,
+            (long long)image_result.binary_hybrid_ms,
+            (unsigned long)image_result.binary_hybrid_black_pixels,
+            (unsigned long)image_result.binary_hybrid_checksum,
             (unsigned)image_result.heap_before_binary,
             (unsigned)image_result.largest_before_binary,
             (unsigned)image_result.heap_with_binary,
             (unsigned)image_result.largest_with_binary,
+            image_result.zxing_attempted ? "true" : "false",
+            image_result.zxing_decoded ? "true" : "false",
+            image_result.zxing_status,
+            (long long)image_result.zxing_decode_ms,
+            image_result.zxing_finder_patterns,
+            image_result.zxing_candidate_sets,
+            image_result.zxing_decode_attempts,
+            image_result.zxing_version,
+            image_result.zxing_ecc,
+            (unsigned)image_result.zxing_payload_bytes,
+            image_result.zxing_payload_match ? "true" : "false",
+            image_result.zxing_payload_match ? payload_hex : "",
+            image_result.zxing_payload_match ? "SCANNER_MATCH" : "UNAVAILABLE_ON_MISMATCH",
+            zxing_meta_json,
+            (unsigned)image_result.zxing_heap_before,
+            (unsigned)image_result.zxing_largest_before,
+            (unsigned)image_result.zxing_heap_with_bitmap,
+            (unsigned)image_result.zxing_largest_with_bitmap,
+            (unsigned)image_result.zxing_heap_after_decode,
+            (unsigned)image_result.zxing_largest_after_decode,
+            image_result.zxing_hybrid_attempted ? "true" : "false",
+            image_result.zxing_hybrid_decoded ? "true" : "false",
+            image_result.zxing_hybrid_status,
+            (long long)image_result.zxing_hybrid_decode_ms,
+            image_result.zxing_hybrid_finder_patterns,
+            image_result.zxing_hybrid_candidate_sets,
+            image_result.zxing_hybrid_decode_attempts,
+            image_result.zxing_hybrid_version,
+            image_result.zxing_hybrid_ecc,
+            (unsigned)image_result.zxing_hybrid_payload_bytes,
+            image_result.zxing_hybrid_payload_match ? "true" : "false",
+            image_result.zxing_hybrid_payload_match ? payload_hex : "",
+            image_result.zxing_hybrid_payload_match ? "SCANNER_MATCH" : "UNAVAILABLE_ON_MISMATCH",
+            zxing_hybrid_meta_json,
+            (unsigned)image_result.zxing_hybrid_heap_before,
+            (unsigned)image_result.zxing_hybrid_largest_before,
+            (unsigned)image_result.zxing_hybrid_heap_with_bitmap,
+            (unsigned)image_result.zxing_hybrid_largest_with_bitmap,
+            (unsigned)image_result.zxing_hybrid_heap_after_decode,
+            (unsigned)image_result.zxing_hybrid_largest_after_decode,
+            (unsigned)image_result.stack_hwm_before_zxing,
+            (unsigned)image_result.stack_hwm_after_zxing,
             image_result.detail
         );
 
@@ -2868,20 +3367,47 @@ esp_err_t analyzer_process_scan_metadata(
         return ESP_FAIL;
     }
 
-    s_json_len =
-        (size_t)n;
-
-    if (
-        s_json_len >=
-        ANALYZER_JSON_MAX)
+    if ((size_t)n >= ANALYZER_JSON_MAX)
     {
-        s_json_len =
-            ANALYZER_JSON_MAX - 1;
+        /*
+         * Never expose a syntactically truncated JSON document.  If the
+         * detailed report outgrows the fixed Analyzer buffer, replace it
+         * with a small valid diagnostic object so the host can distinguish
+         * capacity exhaustion from filesystem corruption.
+         */
+        int fallback_n = snprintf(
+            s_json,
+            ANALYZER_JSON_MAX,
+            "{\n"
+            "  \"firmware_version\": \"%s\",\n"
+            "  \"mode\": \"ANALYZER\",\n"
+            "  \"analysis_status\": \"JSON_CAPACITY_EXCEEDED\",\n"
+            "  \"required_bytes\": %u,\n"
+            "  \"capacity_bytes\": %u\n"
+            "}\n",
+            ANALYZER_FIRMWARE_VERSION,
+            (unsigned)((size_t)n + 1u),
+            (unsigned)ANALYZER_JSON_MAX
+        );
 
-        s_json[
-            s_json_len
-        ] = 0;
+        if (fallback_n < 0 || (size_t)fallback_n >= ANALYZER_JSON_MAX)
+        {
+            analyzer_clear_result();
+            heap_caps_free(payload_hex);
+            heap_caps_free(zxing_meta_json);
+            heap_caps_free(scanner_identity_json);
+            return ESP_ERR_INVALID_SIZE;
+        }
+
+        s_json_len = (size_t)fallback_n;
     }
+    else
+    {
+        s_json_len = (size_t)n;
+    }
+
+    heap_caps_free(payload_hex);
+    heap_caps_free(zxing_meta_json);
 
     heap_caps_free(
         scanner_identity_json

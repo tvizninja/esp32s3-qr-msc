@@ -14,3 +14,6 @@ CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 # default configuration descriptor (configuration_descriptor = NULL).
 CONFIG_TINYUSB_MSC_ENABLED=y
 CONFIG_TINYUSB_MSC_BUFSIZE=512
+
+# Required by the vendored ZXing-C++ QR-only decoder.
+CONFIG_COMPILER_CXX_EXCEPTIONS=y

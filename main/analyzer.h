@@ -11,7 +11,7 @@
 extern "C" {
 #endif
 
-#define ANALYZER_JSON_MAX 4096
+#define ANALYZER_JSON_MAX 32768
 
 esp_err_t analyzer_mode_init(void);
 bool analyzer_mode_enabled(void);

@@ -428,6 +428,19 @@ esp_err_t flash_store_raw_read(
 
 
 
+esp_err_t flash_store_binary_begin(void)
+{
+    if (store_partition == NULL) return ESP_ERR_INVALID_STATE;
+
+    const size_t erase_len = FLASH_SECTOR_SIZE + FLASH_STORE_BINARY_BYTES;
+    const size_t erase_aligned =
+        (erase_len + FLASH_SECTOR_SIZE - 1) & ~(FLASH_SECTOR_SIZE - 1);
+
+    return esp_partition_erase_range(
+        store_partition, binary_header_offset(), erase_aligned);
+}
+
+
 esp_err_t flash_store_binary_write(
     size_t offset,
     const uint8_t *data,

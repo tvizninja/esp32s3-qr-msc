@@ -10,4 +10,5 @@ idf_component_register(
         esp_timer
         esp_partition
         nvs_flash
+        zxing_qr_packed
 )
